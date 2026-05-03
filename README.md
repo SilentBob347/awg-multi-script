@@ -12,6 +12,11 @@
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
 [![Version](https://img.shields.io/badge/version-6.7-ff6b00?style=flat-square)](#)
 
+<br>
+
+[![Boosty](https://img.shields.io/badge/Boosty-Поддержать-F15F2C?style=for-the-badge&logo=boost&logoColor=white)](https://boosty.to/awgtoolza/donate)
+[![YooMoney](https://img.shields.io/badge/YooMoney-Поддержать-8B3FFC?style=for-the-badge&logo=yandex&logoColor=white)](https://yoomoney.ru/to/4100119521619579)
+
 </div>
 
 ---
@@ -107,9 +112,9 @@ sudo awg2
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7                                   ║
-║   AWG 2.0 — QUIC / WebRTC / SIP / DNS                ║
-║              + Warp туннель Cloudflare               ║
+║    AWG Toolza v6.7                           ║
+║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
+║              + Warp туннель Cloudflare       ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
