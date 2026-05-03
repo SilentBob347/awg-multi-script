@@ -5,17 +5,7 @@ VERSION="v6.7"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
-# ─────────────────────────────────────────────────────────────
-# v6.4:
-#   • Сохранение клиентов при «Сбросить сервер» (переподпись)
-#   • Авто-бэкап перед опасными операциями
-#   • Авторемонт awg0 (проверка состояния и восстановление)
-#   • Обновление скрипта с GitHub
-# v6.3:
-# - AWG Toolza — только AWG 2.0
-# - Выбор типа I1 при ручном вводе домена (7 протоколов)
-# - Бекап и восстановление конфигов AWG 2.0 (~/awg_backup/)
-# ─────────────────────────────────────────────────────────────
+#────────────────────────────────────────────────────────────
 
 # ── Цвета ──────────────────────────────────────────────────
 # shellcheck disable=SC2034  # цветовая палитра — часть публичного API функций
@@ -981,18 +971,37 @@ do_repair() {
 
   local issues=0 fixed=0
 
-  # 1. Модуль ядра
-  if lsmod | grep -q '^amneziawg'; then
+  # 1. Модуль ядра — проверяем 3 способами для надёжности
+  # На некоторых VPS lsmod может глючить, /sys/module/ — самый надёжный
+  local mod_loaded=0
+  if [[ -d /sys/module/amneziawg ]]; then
+    mod_loaded=1
+  elif lsmod 2>/dev/null | grep -qE '^amneziawg\s'; then
+    mod_loaded=1
+  elif grep -qE '^amneziawg\s' /proc/modules 2>/dev/null; then
+    mod_loaded=1
+  fi
+
+  if [[ $mod_loaded -eq 1 ]]; then
     ok "Модуль amneziawg загружен"
   else
     warn "Модуль amneziawg НЕ загружен"
     issues=$((issues+1))
     info "Пробую: modprobe amneziawg"
     if modprobe amneziawg 2>/dev/null; then
-      ok "Модуль загружен"
-      fixed=$((fixed+1))
+      # Проверяем результат опять через /sys
+      if [[ -d /sys/module/amneziawg ]]; then
+        ok "Модуль загружен"
+        fixed=$((fixed+1))
+      else
+        warn "modprobe вернул успех, но модуль не виден — попробуй reboot"
+      fi
     else
       err "modprobe amneziawg провалился"
+      info "Проверь вручную:"
+      info "  ls /sys/module/amneziawg     (проверка загрузки)"
+      info "  dkms status amneziawg        (статус сборки)"
+      info "  dmesg | tail -20             (ошибки ядра)"
       info "Возможно нужен reboot или переустановка модуля"
     fi
   fi
@@ -1690,7 +1699,9 @@ EOF
   fi
 
   hdr "⌘  Проверка модуля"
-  if modprobe amneziawg 2>/dev/null; then
+  modprobe amneziawg 2>/dev/null || true
+  # Проверка через /sys для надёжности
+  if [[ -d /sys/module/amneziawg ]] || lsmod 2>/dev/null | grep -qE '^amneziawg\s'; then
     ok "Модуль загружен"
   else
     warn "Модуль не загрузился. Сделай reboot и запусти снова"
@@ -3142,9 +3153,21 @@ _warp_apply_license() {
   echo ""
   hdr "★  Активация Warp+"
   echo ""
-  echo -e "  ${D}Лицензионный ключ — из приложения 1.1.1.1 (Cloudflare WARP):${N}"
-  echo -e "  ${D}Шестерёнка → Аккаунт → Ключ${N}"
-  echo -e "  ${D}Формат: xxxxxxxx-xxxxxxxx-xxxxxxxx${N}"
+  echo -e "  ${W}Где взять лицензионный ключ:${N}"
+  echo ""
+  echo -e "  ${G}1)${N} ${W}Cloudflare Zero Trust${N} ${C}(рекомендуется — безлимит до 50 устройств)${N}"
+  echo -e "     ${D}→ https://one.dash.cloudflare.com/sign-up${N}"
+  echo -e "     ${D}→ Networks → Devices → Connect Device → WireGuard${N}"
+  echo ""
+  echo -e "  ${G}2)${N} ${W}Приложение 1.1.1.1${N} (Cloudflare WARP)"
+  echo -e "     ${D}→ Шестерёнка → Аккаунт → Ключ${N}"
+  echo -e "     ${D}→ Бесплатный аккаунт с базовой квотой${N}"
+  echo ""
+  echo -e "  ${G}3)${N} ${W}Реферальная программа${N} (если ещё работает)"
+  echo -e "     ${D}→ В приложении 1.1.1.1 → пригласи друзей${N}"
+  echo -e "     ${D}→ +1 ГБ за каждого, до 25 ГБ Warp+ бесплатно${N}"
+  echo ""
+  echo -e "  ${D}Формат ключа: xxxxxxxx-xxxxxxxx-xxxxxxxx${N}"
   echo ""
   read -rp "$(echo -e "${C}  Лицензионный ключ (Enter = отмена): ${N}")" LICENSE_KEY
 
@@ -3174,7 +3197,32 @@ _warp_apply_license() {
     return 1
   fi
 
-  ok "Warp+ активирован"
+  # Проверяем что лицензия реально дала Warp+ квоту
+  # (защита от мёртвых рефералок — Cloudflare закрыл программу в начале 2025)
+  local account_type premium_data
+  account_type=$(grep -oP 'account_type\s*=\s*"\K[^"]+' wgcf-account.toml 2>/dev/null || echo "")
+  premium_data=$(grep -oP 'premium_data\s*=\s*\K[0-9]+' wgcf-account.toml 2>/dev/null || echo "0")
+
+  echo ""
+  if [[ "$account_type" == "limited" ]] && [[ ${premium_data:-0} -gt 0 ]]; then
+    # premium_data в байтах, переводим в GiB
+    local premium_gb=$(( premium_data / 1024 / 1024 / 1024 ))
+    if [[ $premium_gb -ge 1000 ]]; then
+      ok "Warp+ активирован — ${premium_gb} GiB (фактически безлимит)"
+    else
+      ok "Warp+ активирован — квота ${premium_gb} GiB"
+    fi
+  elif [[ "$account_type" == "unlimited" ]]; then
+    ok "Warp+ Unlimited активирован (Zero Trust)"
+  else
+    warn "Лицензия применилась, но Warp+ квота не появилась"
+    warn "Возможные причины:"
+    warn "  • Ключ от закрытой реферальной программы (Cloudflare закрыл её в 2025)"
+    warn "  • Ключ уже использован на другом устройстве"
+    warn "  • Ключ невалиден"
+    info "Получи рабочий ключ через Zero Trust: https://one.dash.cloudflare.com/sign-up"
+  fi
+
   info "Перегенерируем профиль..."
   wgcf generate 2>/dev/null && cp "$WARP_DIR/wgcf-profile.conf" "$WARP_CONF" 2>/dev/null
   return 0
