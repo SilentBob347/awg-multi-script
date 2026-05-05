@@ -1146,8 +1146,8 @@ do_self_update() {
 
   # Сравниваем версии (vX.Y → числа). Если на GitHub старше или такая же — спрашиваем.
   local cur_num new_num
-  cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
-  new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
+  cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
+  new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
 
   if [[ "$new_ver" == "?" ]]; then
     warn "Не удалось определить версию"
