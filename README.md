@@ -203,7 +203,13 @@ sudo journalctl -u awg-bot -f       # живые логи
 - **Текст** — пункт 3 → 5 для больших конфигов (QUIC Full) → копируй в буфер
 - **Файл** — `Добавить туннель → Из файла` → передай `/root/<имя>_awg2.conf` через scp
 
+[**AmneziaWG**](https://github.com/amnezia-vpn/amneziawg-windows-client) — официальное приложение протокола AmneziaWG:
+- **Android** — https://play.google.com/store/apps/details?id=org.amnezia.awg
+- **iOS** — https://apps.apple.com/app/amneziawg/id6478942365
+- **Windows** — https://github.com/amnezia-vpn/amneziawg-windows-client/releases/tag/2.0.0
+
 [**Keenetic**](https://docs.amnezia.org/documentation/instructions/keenetic-os-awg) — KeeneticOS 4.x+ или AWG Manager на Entware
+
 
 ---
 
