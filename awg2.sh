@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.7.8"
+VERSION="v6.8.0"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -40,11 +40,79 @@ hdr()  {
 safe_read() {
   local _var_name="$1"
   local _prompt="${2:-}"
-  # Сбрасываем буфер stdin (читаем всё что есть с timeout 0.05 сек)
-  # 2>/dev/null чтобы не выводить ошибки если буфер пуст
-  while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+  # Сбрасываем буфер stdin только в интерактивном режиме (TTY).
+  # В неинтерактивном (heredoc/пайп) -t 0.05 съедает реальный ввод.
+  if [[ -t 0 ]]; then
+    while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+  fi
   # Теперь читаем реальный ответ пользователя
   read -rp "$_prompt" "$_var_name"
+}
+
+# read_choice — читает выбор из числового диапазона с переспросом.
+# Принимает пустой ввод (применит дефолт). Невалидный ввод → переспрос.
+# Использование: read_choice VARNAME "Промпт: " MIN MAX [DEFAULT]
+#   DEFAULT необязателен; если задан — пустой ввод заменяется на него.
+#   Если DEFAULT не задан — пустой ввод тоже считается невалидным.
+read_choice() {
+  local _var_name="$1"
+  local _prompt="$2"
+  local _min="$3"
+  local _max="$4"
+  local _default="${5:-}"
+  local _value
+  while true; do
+    # Сбрасываем буфер stdin только в интерактивном режиме (TTY).
+    # В неинтерактивном (тесты/heredoc) -t 0.05 съедает реальный ввод.
+    if [[ -t 0 ]]; then
+      while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+    fi
+    read -rp "$_prompt" _value
+    # Пустой ввод + есть дефолт → применяем дефолт
+    if [[ -z "$_value" && -n "$_default" ]]; then
+      _value="$_default"
+      break
+    fi
+    # Проверка: число в диапазоне
+    if [[ "$_value" =~ ^[0-9]+$ ]] && (( _value >= _min && _value <= _max )); then
+      break
+    fi
+    echo -e "${R}  Введи число от ${_min} до ${_max}${N}" >&2
+  done
+  # Присваиваем результат вызывающей переменной
+  printf -v "$_var_name" '%s' "$_value"
+}
+
+# read_yesno — читает yes/no с переспросом при невалидном вводе.
+# Принимает: y, yes, д, да, н, n, no, нет (любой регистр).
+# Пустой ввод применяет дефолт (если задан).
+# Использование: read_yesno VARNAME "Промпт" DEFAULT
+#   DEFAULT — "y" или "n" (что вернётся при пустом Enter). Опционально.
+# Результат: переменная получает "y" или "n".
+read_yesno() {
+  local _var_name="$1"
+  local _prompt="$2"
+  local _default="${3:-}"
+  local _value _lc
+  while true; do
+    if [[ -t 0 ]]; then
+      while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+    fi
+    read -rp "$_prompt" _value
+    # Пустой ввод + есть дефолт
+    if [[ -z "$_value" && -n "$_default" ]]; then
+      _value="$_default"
+      break
+    fi
+    # Приводим к нижнему регистру
+    _lc="${_value,,}"
+    case "$_lc" in
+      y|yes|д|да)  _value="y"; break ;;
+      n|no|н|нет)  _value="n"; break ;;
+      *) echo -e "${R}  Ответь y/yes/да или n/no/нет${N}" >&2 ;;
+    esac
+  done
+  printf -v "$_var_name" '%s' "$_value"
 }
 
 # Тематические хелперы
@@ -66,8 +134,7 @@ prompt_retry() {
   echo -e "  ${Y}↵ 2) Вернуться в меню${N}"
   echo ""
   local RETRY_CHOICE
-  read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 2): ${N}")" RETRY_CHOICE || return 1
-  RETRY_CHOICE=${RETRY_CHOICE:-2}
+  read_choice RETRY_CHOICE "$(echo -e "${C}  Выбор [1-2] (Enter = 2): ${N}")" 1 2 2
   if [[ "$RETRY_CHOICE" == "1" ]]; then return 0; fi
   return 1
 }
@@ -112,72 +179,58 @@ log_info()  { _log "INFO"  "$@"; }
 log_warn()  { _log "WARN"  "$@"; }
 log_err()   { _log "ERROR" "$@"; }
 
-# Россия
+# Универсальный пул — домены работают И в РФ (не в реестре РКН), И в мире.
+# Используются как для SNI/мимикри TLS, так и для QUIC/SIP/DTLS.
+# RU и WORLD массивы оставлены идентичными — choose_region сохранён для совместимости
+# со старыми конфигами (метка "# Region: ru" в шапке awg0.conf).
+
+# TLS SNI (ClientHello) — крупные мировые сайты, открытые в РФ
 TLS_DOMAINS_RU=(
-  "yandex.ru" "vk.com" "mail.ru" "ozon.ru" "wildberries.ru"
-  "sberbank.ru" "tbank.ru" "gosuslugi.ru" "kaspersky.ru"
+  "google.com" "github.com" "gitlab.com" "stackoverflow.com"
+  "microsoft.com" "apple.com" "amazon.com" "wikipedia.org"
+  "mozilla.org" "kernel.org" "debian.org" "ubuntu.com"
+  "cdn.jsdelivr.net" "unpkg.com" "pypi.org"
+  "hetzner.com" "ovhcloud.com" "digitalocean.com"
+  "steampowered.com" "spotify.com"
 )
 DTLS_DOMAINS_RU=(
-  "stun.yandex.net" "stun.vk.com" "stun.mail.ru" "stun.sber.ru"
+  # Только домены, реально отвечающие на ICMP ping.
+  # Удалены: stun.stunprotocol.org (мёртв), stun.services.mozilla.com (закрыт
+  # в 2023), global.stun.twilio.com (требует API-ключ, дропает ICMP).
+  "meet.jit.si" "stun.nextcloud.com" "stun.sipgate.net"
+  "stun.zoiper.com" "stun.l.google.com"
 )
 SIP_DOMAINS_RU=(
-  "sip.beeline.ru" "sip.mts.ru" "sip.megafon.ru" "sip.rostelecom.ru"
-  "sip.yandex.ru" "sip.vk.com" "sip.mail.ru" "sip.sipnet.ru"
-  "sip.tele2.ru" "sip.ucoz.ru"
+  # Глобальные
+  "sip.zadarma.com" "sip.iptel.org" "sip.linphone.org" "sip.antisip.com"
+  # Германия
+  "sip.dus.net" "sip.easybell.de"
+  # NL / CH / IT
+  "sip.voys.nl" "sip.peoplefone.ch" "sip.messagenet.it"
+  # UDP-only серверы убраны: sipgate.de, sip.1und1.de, sip.ovh.net,
+  # sip.voipfone.co.uk, sip.voiptalk.org, sip.gradwell.com,
+  # sip.voipgate.com, sip.bahnhof.se — все они слушают только UDP/5060
+  # и блокируют ICMP, поэтому фоллбэк на ping тоже не работает.
 )
-# HTTP/3 (QUIC) — реально раздают h3 в РФ сегменте, НЕ заблокированы ТСПУ
+# HTTP/3 (QUIC) — реально отвечают h3 на UDP/443, не заблокированы ТСПУ
 QUIC_DOMAINS_RU=(
-  "yandex.ru" "mail.ru" "vk.com" "ya.ru" "dzen.ru"
-  "yastatic.net" "ozon.ru" "avito.ru" "wildberries.ru"
-  "sber.ru" "tbank.ru" "gosuslugi.ru" "kinopoisk.ru"
-  "cdn.gcore.com" "gcdn.co" "selectel.ru"
-)
-
-# Европа / Мир
-TLS_DOMAINS_WORLD=(
-  "github.com" "gitlab.com" "stackoverflow.com" "microsoft.com"
-  "apple.com" "amazon.com" "google.com"
-  "wikipedia.org" "spotify.com" "steampowered.com"
-  "hetzner.com" "ovhcloud.com" "digitalocean.com"
-  "cdn.jsdelivr.net" "unpkg.com" "pypi.org"
-)
-DTLS_DOMAINS_WORLD=(
-  "stun.stunprotocol.org" "meet.jit.si" "stun.services.mozilla.com"
-  "global.stun.twilio.com" "stun.nextcloud.com"
-  "stun.sipgate.net" "stun.zoiper.com"
-)
-SIP_DOMAINS_WORLD=(
-  # Глобальные SIP-провайдеры
-  "sip.zadarma.com" "sip.iptel.org" "sip.linphone.org"
-  "sip.antisip.com"
-  # Европа — Германия
-  "sipgate.de" "sip.dus.net" "sip.easybell.de" "sip.1und1.de"
-  "sip.t-online.de" "sipcall.de"
-  # Европа — Франция
-  "sip.ovh.net" "sip.free.fr" "sip.numericable.fr"
-  # Европа — Великобритания
-  "sip.voipfone.co.uk" "sip.voiptalk.org" "sip.gradwell.com"
-  "sip.sipgate.co.uk"
-  # Европа — Нидерланды/Швейцария/Австрия
-  "sip.voipgate.com" "sip.voys.nl" "sip.peoplefone.ch"
-  "sip.fonira.com"
-  # Италия / Испания
-  "sip.messagenet.it" "sip.eutelia.it" "sip.fonyou.com"
-  # Скандинавия
-  "sip.bahnhof.se" "sip.com.no"
-)
-# HTTP/3 (QUIC) — все реально отвечают h3 на UDP/443, НЕ заблокированы ТСПУ
-QUIC_DOMAINS_WORLD=(
-  "cdn.gcore.com" "gcdn.co" "g.gcdn.co"
-  "fastly.net" "a.ssl.fastly.net" "global.fastly.net"
-  "cdn-apple.com" "icloud.com" "mzstatic.com"
+  # Удалены ICMP-блокирующие: cdn-apple.com, steamstatic.com, steamcontent.com.
+  # (h3 у них работает, но ping-проверка систематически даёт fail.)
+  "google.com" "youtube.com"
   "cdn.jsdelivr.net" "unpkg.com"
-  "steamstatic.com" "steamcontent.com"
+  "icloud.com" "mzstatic.com"
+  "fastly.net" "a.ssl.fastly.net"
   "b-cdn.net" "bunny.net" "cdn77.com"
   "github.com" "objects.githubusercontent.com"
-  "spotify.com" "scdn.co"
   "wikipedia.org" "wikimedia.org"
+  "gcdn.co" "g.gcdn.co"
 )
+
+# WORLD — синонимы RU (универсальный пул)
+TLS_DOMAINS_WORLD=("${TLS_DOMAINS_RU[@]}")
+DTLS_DOMAINS_WORLD=("${DTLS_DOMAINS_RU[@]}")
+SIP_DOMAINS_WORLD=("${SIP_DOMAINS_RU[@]}")
+QUIC_DOMAINS_WORLD=("${QUIC_DOMAINS_RU[@]}")
 
 # Активные пулы (устанавливаются при выборе региона)
 TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
@@ -198,8 +251,7 @@ choose_region() {
   echo -e "  ${G}2${N}  Россия — RU "
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local REGION_CHOICE
-  read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" REGION_CHOICE
-  REGION_CHOICE=${REGION_CHOICE:-1}
+  read_choice REGION_CHOICE "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
   case $REGION_CHOICE in
     2)
       SERVER_REGION="ru"
@@ -209,7 +261,7 @@ choose_region() {
       QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
       echo -e "${G}  √ Регион: Россия${N}"
       ;;
-    *)
+    1)
       SERVER_REGION="world"
       TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
       DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
@@ -225,6 +277,59 @@ choose_region() {
 # ВАЖНО: не вызывать в subshell (| или $(...)) — массив потеряется
 SCAN_POOL_RESULT=()
 
+# Универсальная проверка доступности хоста.
+# Профиль tls → TCP-connect через /dev/tcp на :443 (быстро, обходит ICMP-блок).
+# Профили sip/dtls/quic → ICMP ping (для SIP — потому что большинство серверов
+# слушают UDP/5060, а не TCP/5060; для STUN/QUIC — UDP-only сервисы).
+# Вывод stdout:
+#   "ok <ms>" при успехе (ms = округлённое время отклика)
+#   "fail"    при недоступности
+# Аргументы: $1 = profile (tls|sip|dtls|quic), $2 = host
+_probe_host() {
+  local profile="$1" host="$2"
+  local port="" use_tcp=0
+  case "$profile" in
+    tls)  port=443;  use_tcp=1 ;;
+    sip|dtls|quic|*) use_tcp=0 ;;
+  esac
+
+  if [[ $use_tcp -eq 1 ]]; then
+    # TCP-connect через /dev/tcp с замером времени.
+    # ВАЖНО: SECONDS — bash-builtin, секундная точность; для ms используем EPOCHREALTIME (bash 5+)
+    local t0 t1 ms_int
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      t0=$EPOCHREALTIME
+      if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+        t1=$EPOCHREALTIME
+        exec 3<&- 3>&- 2>/dev/null || true
+        # Разница в секундах с дробной частью → миллисекунды
+        ms_int=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%d", (b-a)*1000}')
+        [[ $ms_int -lt 1 ]] && ms_int=1
+        echo "ok $ms_int"
+      else
+        echo "fail"
+      fi
+    else
+      # Bash < 5: без точного ms — отдаём фиктивные 50мс при успехе
+      if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+        exec 3<&- 3>&- 2>/dev/null || true
+        echo "ok 50"
+      else
+        echo "fail"
+      fi
+    fi
+  else
+    # ICMP ping для UDP-only сервисов (STUN/QUIC) — fallback
+    local ms
+    ms=$(timeout 2 ping -c 1 -W 1 "$host" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+    if [[ -n "$ms" ]]; then
+      printf "ok %.0f\n" "$ms"
+    else
+      echo "fail"
+    fi
+  fi
+}
+
 scan_pool() {
   # shellcheck disable=SC2034  # pool_name для отладки/логов
   local pool_name="$1"
@@ -238,9 +343,16 @@ scan_pool() {
   # Ловушка на прерывание — cleanup + выход
   trap 'rm -rf "$tmpdir"; exit 1' INT TERM
 
-  # Запускаем все ping параллельно
+  # Профиль для проверки: tls/sip → TCP-connect, dtls/quic → ping
+  # pool_name приходит как "tls"|"sip"|"dtls"|"quic" из select_random_domain
+  local probe_profile="$pool_name"
+
+  # Запускаем все проверки параллельно
   for domain in "${domains[@]}"; do
-    (timeout 2 ping -c 1 -W 1 "$domain" &>/dev/null 2>&1 && echo "ok" || echo "fail") > "$tmpdir/${domain//./_}" &
+    (
+      result=$(_probe_host "$probe_profile" "$domain")
+      if [[ "$result" == ok* ]]; then echo "ok"; else echo "fail"; fi
+    ) > "$tmpdir/${domain//./_}" &
   done
   wait  # Ждём завершения всех
 
@@ -286,13 +398,18 @@ select_random_domain() {
 }
 
 # Единый Python генератор для всех профилей мимикрии
-# Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
 import sys, secrets, struct, random
 
+# ── Утилиты ────────────────────────────────────────────
 def rh(n):  return secrets.token_bytes(n)
-def ri(a,b): return random.randint(a,b)
-def rc(lst): return random.choice(lst)
+# Криптостойкий int [a..b] — заменяет random.randint для всех параметров
+# где предсказуемость нежелательна (pn_len, ports, expires и т.д.)
+def ri(a, b):
+    if a > b: a, b = b, a
+    span = b - a + 1
+    return a + secrets.randbelow(span)
+def rc(lst): return lst[secrets.randbelow(len(lst))]
 def u16(v): return struct.pack(">H", v & 0xFFFF)
 def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def u24(v): return struct.pack(">I", v)[1:]
@@ -302,25 +419,51 @@ def qv(v):
     else:         return bytes([0x80|(v>>24)&0x3f,(v>>16)&0xff,(v>>8)&0xff,v&0xff])
 def to_cps(raw): return "<b 0x%s>" % raw.hex()
 
+# Криптостойкий shuffle (Fisher-Yates) — заменяет random.shuffle
+def secure_shuffle(lst):
+    for i in range(len(lst) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        lst[i], lst[j] = lst[j], lst[i]
+    return lst
+
+# Случайный приватный IP — три варианта подсетей (10/8, 172.16/12, 192.168/16)
+def rand_private_ip():
+    kind = secrets.randbelow(3)
+    if kind == 0:
+        return "10.%d.%d.%d" % (ri(1, 254), ri(0, 255), ri(2, 254))
+    elif kind == 1:
+        return "172.%d.%d.%d" % (ri(16, 31), ri(0, 255), ri(2, 254))
+    else:
+        return "192.168.%d.%d" % (ri(0, 255), ri(2, 254))
+
 # ── Аргументы ──────────────────────────────────────────
 # argv[1] = profile: quic|sip|dns
 # argv[2] = domain (опционально, иначе из пула)
+ALLOWED_PROFILES = ("quic", "sip", "dns")
 PROFILE = sys.argv[1] if len(sys.argv) > 1 else "quic"
 DOMAIN  = sys.argv[2] if len(sys.argv) > 2 else ""
 
+# Валидация PROFILE — защита от опечатки в вызывающем коде.
+# При неизвестном профиле фоллбэк на "quic" + warn в stderr (не прерываем,
+# чтобы не сломать пайплайн, но даём диагностику).
+if PROFILE not in ALLOWED_PROFILES:
+    sys.stderr.write("[CPS] WARN: unknown profile \"%s\", fallback=quic\n" % PROFILE)
+    PROFILE = "quic"
+
 DOMAIN_POOL = [
-    "google.com","github.com","microsoft.com","cloudflare.com","apple.com",
-    "amazon.com","mozilla.org","zoom.us","dropbox.com","spotify.com",
-    "yandex.ru","vk.com","mail.ru","ozon.ru","ya.ru",
-    "sberbank.ru","gosuslugi.ru","wildberries.ru","avito.ru","hh.ru",
+    "google.com","github.com","gitlab.com","stackoverflow.com",
+    "microsoft.com","apple.com","amazon.com","wikipedia.org",
+    "mozilla.org","cdn.jsdelivr.net","unpkg.com","pypi.org",
+    "ubuntu.com","debian.org","hetzner.com","ovhcloud.com",
+    "digitalocean.com",
 ]
 if not DOMAIN:
     DOMAIN = rc(DOMAIN_POOL)
 
 SIP_POOL = [
     "sipgate.de","sip.ovh.net","sip.voipfone.co.uk","sip.linphone.org",
-    "sip.beeline.ru","sip.mts.ru","sip.megafon.ru","sip.tele2.ru",
-    "sip.dus.net","sip.easybell.de","sip.1und1.de","sip.voys.nl",
+    "sip.zadarma.com","sip.dus.net","sip.easybell.de","sip.1und1.de",
+    "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
 ]
 
 # ── I1: QUIC Long Header Initial, строго 1200 байт ─────
@@ -333,6 +476,10 @@ def gen_quic_initial(domain=None):
     scid   = rh(8)
     # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
     enc_size  = TARGET - 26 - pn_len
+    # Защита от отрицательного размера (на текущих параметрах невозможно,
+    # но защищаемся от будущих правок констант)
+    if enc_size < 1:
+        enc_size = 1
     plen_val  = pn_len + enc_size
     pl_varint = u16(0x4000 | plen_val)
     pn      = rh(pn_len)
@@ -342,13 +489,24 @@ def gen_quic_initial(domain=None):
     pkt = (bytes([fb]) + b"\x00\x00\x00\x01" +
            bytes([8]) + dcid + bytes([8]) + scid +
            b"\x00" + pl_varint + pn + payload)
-    assert len(pkt) == TARGET, "I1 size=%d" % len(pkt)
+    # Защита размера — без assert (assert удаляется при python3 -O)
+    if len(pkt) != TARGET:
+        # Достраиваем или обрезаем до TARGET
+        if len(pkt) < TARGET:
+            pkt += rh(TARGET - len(pkt))
+        else:
+            pkt = pkt[:TARGET]
     return pkt
 
 # ── I2-I5: QUIC Short Header (1-RTT) ───────────────────
-# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F
+# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F.
+# ВАЖНО: в реальном QUIC v1 биты spin/key_phase/pn_len МАСКИРУЮТСЯ
+# header protection (RFC 9001 §5.4) — DPI видит их как случайные.
+# Здесь они и так случайные, поэтому корректно имитируется HP-masked байт.
+# pn_len теперь 1-4 (Chrome чаще шлёт 2-4) для большей реалистичности.
 def gen_quic_short():
-    pn_len = ri(1, 2)
+    pn_len = ri(1, 4)
+    # Биты второго уровня — после HP они выглядят случайно для DPI
     spin   = ri(0, 1) << 5
     key    = ri(0, 1) << 2
     fb     = 0x40 | spin | key | (pn_len - 1)
@@ -358,40 +516,72 @@ def gen_quic_short():
     return bytes([fb]) + dcid + pn + data
 
 # ── SIP REGISTER ────────────────────────────────────────
+# Полный реалистичный набор заголовков как у Linphone / Zoiper / MicroSIP.
+# Минималистичный REGISTER без User-Agent/Allow/Supported характерен
+# для сканеров и легко детектится SIP-aware DPI.
+SIP_UA_POOL = [
+    "Linphone/5.2.5 (belle-sip/5.2.0)",
+    "Zoiper rv2.10.20.4",
+    "MicroSIP/3.21.4",
+    "Bria 6.5.1",
+    "PortSIP UA 16.4",
+]
 def gen_sip():
     host   = rc(SIP_POOL)
-    user   = rc(["alice","bob","100","200","sip"]) + str(ri(10,99))
-    lip    = "10.%d.%d.%d" % (ri(0,255), ri(0,255), ri(10,200))
-    lport  = rc([5060,5062,5080])
+    user   = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
+    lip    = rand_private_ip()
+    lport  = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
     branch = "z9hG4bK" + secrets.token_hex(7)
     tag    = secrets.token_hex(4)
     callid = "%s@%s" % (secrets.token_hex(8), host)
     cseq   = ri(1, 50)
+    # transport чаще UDP (исторически), реже TCP/TLS
+    transport = rc(["udp","udp","udp","udp","tcp"])
+    user_agent = rc(SIP_UA_POOL)
     lines  = [
         "REGISTER sip:%s SIP/2.0" % host,
-        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
+        "Via: SIP/2.0/%s %s:%d;branch=%s;rport" % (transport.upper(), lip, lport, branch),
         "Max-Forwards: 70",
         "From: <sip:%s@%s>;tag=%s" % (user, host, tag),
         "To: <sip:%s@%s>" % (user, host),
         "Call-ID: %s" % callid,
         "CSeq: %d REGISTER" % cseq,
-        "Contact: <sip:%s@%s:%d;transport=udp>" % (user, lip, lport),
+        "Contact: <sip:%s@%s:%d;transport=%s>" % (user, lip, lport, transport),
+        "User-Agent: %s" % user_agent,
+        "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
+        "Supported: replaces, outbound, gruu, path",
         "Expires: %d" % rc([300,600,1800,3600]),
         "Content-Length: 0",
         "", ""
     ]
     return "\r\n".join(lines).encode()
 
-# ── DNS Query ────────────────────────────────────────────
-# I1 начинается с <r 2> (TXID), остальные — тоже с TXID
+# ── DNS Query c EDNS0 ───────────────────────────────────
+# Современные клиенты (systemd-resolved, Chrome, dnsmasq) всегда шлют
+# EDNS0 OPT-RR с advertised buffer size. Без него запрос выглядит как
+# legacy-резолвер — редкий паттерн в современном трафике.
+# I1 начинается с <r 2> (TXID), остальные — тоже с TXID.
 def gen_dns(domain=None):
     host  = domain or DOMAIN
     flags = b"\x01\x00"   # QR=0 Query, RD=1
+    # counts: QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1 (для OPT-RR)
+    counts = b"\x00\x01\x00\x00\x00\x00\x00\x01"
     qn    = b""
     for lbl in host.split("."):
-        qn += bytes([len(lbl)]) + lbl.encode()
+        # Защита от лейблов > 63 байт (DNS RFC 1035)
+        lbl_b = lbl.encode()[:63]
+        qn += bytes([len(lbl_b)]) + lbl_b
     qn += b"\x00"
-    return flags + b"\x00\x01\x00\x00\x00\x00\x00\x00" + qn + b"\x00\x01\x00\x01"
+    qtype  = b"\x00\x01"   # A record
+    qclass = b"\x00\x01"   # IN
+    # EDNS0 OPT-RR (RFC 6891):
+    #   NAME=root(0x00), TYPE=OPT(41=0x29), CLASS=UDP_size (1232/4096),
+    #   TTL=ext_rcode(0)+version(0)+flags(0/DO=0x8000), RDLEN=0
+    udp_size = rc([1232, 4096])   # 1232 — systemd-resolved, 4096 — bind/dnsmasq
+    do_bit   = rc([0x0000, 0x8000])  # DO=0 чаще, DO=1 для DNSSEC-aware
+    opt_rr   = (b"\x00" + b"\x00\x29" + u16(udp_size) +
+                b"\x00\x00" + u16(do_bit) + b"\x00\x00")
+    return flags + counts + qn + qtype + qclass + opt_rr
 
 # ── Dispatch ─────────────────────────────────────────────
 if PROFILE == "sip":
@@ -399,12 +589,11 @@ if PROFILE == "sip":
     print(""); print(""); print(""); print("")
 
 elif PROFILE == "dns":
-    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS
+    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS + OPT
     # TXID рандомный через <r 2> — в начале каждого пакета
     # Разные домены для I1-I5 чтобы не было паттерна
-    import random as _r
     pool = DOMAIN_POOL.copy()
-    _r.shuffle(pool)
+    secure_shuffle(pool)
     for i in range(5):
         dom = pool[i % len(pool)]
         print("<r 2><b 0x%s>" % gen_dns(dom).hex())
@@ -451,12 +640,7 @@ choose_obf_level() {
   echo -e "  ${Y}3${N}  AWG 2.0 + I1-I5 полный CPS chain"
   echo -e "     ${D}Максимум DPI bypass. Некоторые клиенты могут глючить.${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  read -rp "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" OBF_LEVEL
-  OBF_LEVEL=${OBF_LEVEL:-1}
-  case $OBF_LEVEL in
-    1|2|3) ;;
-    *) OBF_LEVEL=1 ;;
-  esac
+  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 1
   local label
   case $OBF_LEVEL in
     1) label="Базовый (без CPS)" ;;
@@ -489,14 +673,12 @@ choose_mimicry_profile() {
   echo -e "  ${G}3${N}  DNS   — DNS Query с рандомным TXID (<r 2>)"
   echo -e "     ${D}Компактный, I1-I5 с TXID prefix.${N}"
   echo ""
-  read -rp "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" PROFILE_CHOICE
-  PROFILE_CHOICE=${PROFILE_CHOICE:-1}
+  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 1
 
   case $PROFILE_CHOICE in
     1) MIMICRY_PROFILE="quic" ;;
     2) MIMICRY_PROFILE="sip"  ;;
     3) MIMICRY_PROFILE="dns"  ;;
-    *) MIMICRY_PROFILE="quic" ;;
   esac
 
   # Выбираем домен из пула под профиль
@@ -725,9 +907,7 @@ do_sniff_test() {
       printf "  ${G}%d)${N} %-24s ${D}%s${N}\n" "$((k+1))" "${name_list[$k]}" "${ep_list[$k]}"
     done
     local PEER_SEL
-    read -rp "$(echo -e "${C}  Выбор [1-${#ep_list[@]}] (Enter = 1): ${N}")" PEER_SEL
-    PEER_SEL=${PEER_SEL:-1}
-    [[ "$PEER_SEL" =~ ^[0-9]+$ ]] && (( PEER_SEL >= 1 && PEER_SEL <= ${#ep_list[@]} )) || { warn "Неверный выбор"; return 0; }
+    read_choice PEER_SEL "$(echo -e "${C}  Выбор [1-${#ep_list[@]}] (Enter = 1): ${N}")" 1 "${#ep_list[@]}" 1
     sel_idx=$((PEER_SEL - 1))
   fi
   client_ep="${ep_list[$sel_idx]}"
@@ -806,8 +986,16 @@ check_deps() {
   HAS_CLIENT_CONFS=false
   HAS_BACKUPS=false
 
-  command -v awg &>/dev/null && HAS_AWG=true
-  command -v qrencode &>/dev/null && HAS_QRENCODE=true
+  # Кэш проверки бинарей (они не появляются/исчезают в течение сессии).
+  # _DEPS_CACHED — пустая до первой проверки, потом "1".
+  if [[ -z "${_DEPS_CACHED:-}" ]]; then
+    command -v awg &>/dev/null && _CACHED_HAS_AWG=true || _CACHED_HAS_AWG=false
+    command -v qrencode &>/dev/null && _CACHED_HAS_QRENCODE=true || _CACHED_HAS_QRENCODE=false
+    _DEPS_CACHED=1
+  fi
+  HAS_AWG="$_CACHED_HAS_AWG"
+  HAS_QRENCODE="$_CACHED_HAS_QRENCODE"
+
   [[ -f "$SERVER_CONF" ]] && HAS_SERVER_CONF=true
 
   # Восстанавливаем SERVER_REGION из шапки конфига если сервер создан
@@ -1108,6 +1296,33 @@ do_repair() {
     fi
   fi
 
+  # Права на конфиги (если случайно сменили — клиенты могут не подняться)
+  if [[ -d /etc/amnezia/amneziawg ]]; then
+    local dir_perm
+    dir_perm=$(stat -c '%a' /etc/amnezia/amneziawg 2>/dev/null || echo "")
+    if [[ "$dir_perm" != "700" ]]; then
+      warn "Папка /etc/amnezia/amneziawg имеет права $dir_perm (должно быть 700)"
+      issues=$((issues+1))
+      chmod 700 /etc/amnezia/amneziawg 2>/dev/null && \
+        ok "Права 700 восстановлены" && fixed=$((fixed+1))
+    else
+      ok "Права /etc/amnezia/amneziawg = 700"
+    fi
+  fi
+
+  if [[ -f "$SERVER_CONF" ]]; then
+    local conf_perm
+    conf_perm=$(stat -c '%a' "$SERVER_CONF" 2>/dev/null || echo "")
+    if [[ "$conf_perm" != "600" ]]; then
+      warn "Серверный конфиг имеет права $conf_perm (должно быть 600)"
+      issues=$((issues+1))
+      chmod 600 "$SERVER_CONF" 2>/dev/null && \
+        ok "Права 600 восстановлены" && fixed=$((fixed+1))
+    else
+      ok "Права $SERVER_CONF = 600"
+    fi
+  fi
+
   # Итог
   echo ""
   if [[ $issues -eq 0 ]]; then
@@ -1155,7 +1370,8 @@ do_self_update() {
 
   # Добавляем nocache параметр чтобы обойти GitHub CDN
   # GitHub raw кеширует на 5 минут — без этого новый код не виден сразу после push
-  local fetch_url="${UPDATE_URL}?nocache=$(date +%s)"
+  local fetch_url
+  fetch_url="${UPDATE_URL}?nocache=$(date +%s)"
   info "Скачиваем (с обходом CDN кеша)..."
   if ! curl -fsSL --connect-timeout 10 --max-time 60 \
        -H "Cache-Control: no-cache, no-store" \
@@ -1228,7 +1444,7 @@ do_self_update() {
   if [[ "$new_ver" == "?" ]]; then
     warn "Не удалось определить версию"
     local CONFIRM_FORCE
-    safe_read CONFIRM_FORCE "$(echo -e "${C}  Установить всё равно? [y/N]: ${N}")"
+    read_yesno CONFIRM_FORCE "$(echo -e "${C}  Установить всё равно? [y/N]: ${N}")" "n"
     if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
       rm -f "$tmp_file"
       return 0
@@ -1239,7 +1455,7 @@ do_self_update() {
     echo -e "${Y}  Возможно ты обновлял скрипт вручную, а в репо ещё старая версия.${N}"
     echo ""
     local CONFIRM_DOWNGRADE
-    safe_read CONFIRM_DOWNGRADE "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")"
+    read_yesno CONFIRM_DOWNGRADE "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")" "n"
     if [[ ! "$CONFIRM_DOWNGRADE" =~ ^[Yy]$ ]]; then
       info "Отменено — текущая версия сохранена"
       rm -f "$tmp_file"
@@ -1248,7 +1464,7 @@ do_self_update() {
   elif [[ "$new_num" -eq "$cur_num" ]]; then
     info "Версия совпадает, но содержимое отличается (обновление через git без bump VERSION?)"
     local CONFIRM_FORCE
-    safe_read CONFIRM_FORCE "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")"
+    read_yesno CONFIRM_FORCE "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")" "n"
     if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
       rm -f "$tmp_file"
       return 0
@@ -1258,7 +1474,8 @@ do_self_update() {
   fi
 
   # ───── 6. Бэкап текущего скрипта ─────
-  local backup="${target}.bak.$(date +%s)"
+  local backup
+  backup="${target}.bak.$(date +%s)"
   if cp "$target" "$backup" 2>/dev/null; then
     info "Резервная копия: $backup"
   else
@@ -1357,7 +1574,7 @@ show_menu() {
   else
     echo -e "  ${D}5) Перезапустить awg0 (нужен пункт 2)${N}"
   fi
-  echo -e "  ${G}6)${N} Проверить домены из пулов (ping)"
+  echo -e "  ${G}6)${N} Проверить домены из пулов (TCP+ping)"
   if $HAS_SERVER_CONF; then
     echo -e "  ${G}7)${N} Тест DPI мимикрии (захват CPS пакета)"
   else
@@ -1426,7 +1643,7 @@ show_menu() {
   echo ""
   echo -e "  ${W}0)${N} Выход"
   echo ""
-  read -rp "$(echo -e "${C}  Выбор: ${N}")" CHOICE
+  safe_read CHOICE "$(echo -e "${C}  Выбор: ${N}")"
 }
 
 choose_dns() {
@@ -1448,15 +1665,13 @@ choose_dns() {
   echo "  3) OpenDNS     — 208.67.222.222, 208.67.220.220"
   echo "  4) Яндекс DNS  — 77.88.8.8, 77.88.8.1"
   echo "  5) Вручную"
-  read -rp "$(echo -e "${C}  Выбор [1-5] (Enter = Cloudflare): ${N}")" DNS_CHOICE
-  DNS_CHOICE=${DNS_CHOICE:-1}
+  read_choice DNS_CHOICE "$(echo -e "${C}  Выбор [1-5] (Enter = Cloudflare): ${N}")" 1 5 1
   case $DNS_CHOICE in
     1) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
     2) CLIENT_DNS="8.8.8.8, 8.8.4.4" ;;
     3) CLIENT_DNS="208.67.222.222, 208.67.220.220" ;;
     4) CLIENT_DNS="77.88.8.8, 77.88.8.1" ;;
     5) read -rp "  DNS: " CLIENT_DNS ;;
-    *) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
   esac
 }
 
@@ -1749,8 +1964,18 @@ EOF
     err "Kernel headers для ${running_kernel} не найдены"
     echo ""
     # Проверяем — есть ли headers под ДРУГУЮ версию ядра (значит был upgrade)
-    local installed_headers
-    installed_headers=$(ls /lib/modules/ 2>/dev/null | grep -v "$running_kernel" | head -3)
+    local installed_headers=""
+    local _k _count=0
+    for _k in /lib/modules/*/; do
+      [[ -d "$_k" ]] || continue
+      _k=${_k%/}
+      _k=${_k##*/}
+      [[ "$_k" == "$running_kernel" ]] && continue
+      installed_headers+="${_k}"$'\n'
+      _count=$((_count + 1))
+      [[ $_count -ge 3 ]] && break
+    done
+    installed_headers="${installed_headers%$'\n'}"
     if [[ -n "$installed_headers" ]]; then
       warn "Обнаружены headers под другие ядра:"
       echo "$installed_headers" | while read k; do echo "    /lib/modules/$k"; done
@@ -1866,17 +2091,34 @@ EOF
   chmod 700 /etc/amnezia/amneziawg
 
   hdr "◼  Firewall (UFW)"
-  local ssh_port
-  read -rp "$(echo -e "${C}  SSH порт [22]: ${N}")" ssh_port
-  ssh_port=${ssh_port:-22}
-  ufw allow "${ssh_port}/tcp" comment "SSH" || true
-  ufw allow 80/tcp  comment "HTTP"  || true
-  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-  ufw --force enable || true
-  ufw status verbose
+  if command -v ufw &>/dev/null; then
+    local ufw_status
+    ufw_status=$(ufw status 2>/dev/null | head -1 || true)
+    info "Текущее состояние UFW: ${ufw_status:-неизвестно}"
+    # Только подготовка forward policy (нужно для NAT клиентов AWG).
+    # НЕ открываем SSH/HTTP — не нашего ума дело.
+    # НЕ включаем UFW принудительно — пользователь сам решит.
+    # Порт AWG/WARP/DNS откроется на соответствующих шагах,
+    # только если UFW активен на тот момент.
+    if [[ -f /etc/default/ufw ]]; then
+      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+      info "DEFAULT_FORWARD_POLICY=ACCEPT (требуется для NAT клиентов)"
+    fi
+    if echo "$ufw_status" | grep -qi "inactive"; then
+      echo ""
+      echo -e "  ${Y}!${N} UFW сейчас выключен. Скрипт его не включает автоматически —"
+      echo -e "    чтобы не отрезать тебе SSH-доступ. Если используешь UFW —"
+      echo -e "    включи сам: ${W}ufw allow <твой SSH порт>/tcp && ufw enable${N}"
+    else
+      info "UFW активен — порты AWG/WARP/DNS будут открыты на соответствующих шагах"
+    fi
+  else
+    info "UFW не установлен — пропускаем"
+  fi
 
   echo ""
   success_box "Установка завершена"
+  _DEPS_CACHED=""  # сбрасываем кэш — теперь awg доступен
   info "Следующий шаг: пункт меню 2 — Создать сервер"
   break
   done
@@ -1909,8 +2151,7 @@ do_gen() {
   echo "  8) Вручную"
   MTU=""
   local MTU_CHOICE
-  read -rp "$(echo -e "${C}  Выбор [1-8] (Enter = 1320): ${N}")" MTU_CHOICE
-  MTU_CHOICE=${MTU_CHOICE:-5}
+  read_choice MTU_CHOICE "$(echo -e "${C}  Выбор [1-8] (Enter = 1320): ${N}")" 1 8 5
   case $MTU_CHOICE in
     1) MTU=1420 ;;
     2) MTU=1380 ;;
@@ -1928,7 +2169,6 @@ do_gen() {
         warn "Некорректный MTU. Должно быть число 1280-1500"
       done
       ;;
-    *) MTU=1320 ;;
   esac
 
   choose_obf_level
@@ -1943,8 +2183,7 @@ do_gen() {
   echo "  6) Вручную"
   local CLIENT_ADDR="" SERVER_ADDR="" CLIENT_NET=""
   local ADDR_CHOICE
-  read -rp "$(echo -e "${C}  Выбор [1-6] (Enter = 1 случайная): ${N}")" ADDR_CHOICE
-  ADDR_CHOICE=${ADDR_CHOICE:-1}
+  read_choice ADDR_CHOICE "$(echo -e "${C}  Выбор [1-6] (Enter = 1 случайная): ${N}")" 1 6 1
   case $ADDR_CHOICE in
     1)
       local rnd_octet2 rnd_octet3
@@ -1960,17 +2199,22 @@ do_gen() {
     4) CLIENT_ADDR="10.102.0.2/32"; SERVER_ADDR="10.102.0.1/24"; CLIENT_NET="10.102.0.0/24" ;;
     5) CLIENT_ADDR="10.44.5.2/32"; SERVER_ADDR="10.44.5.1/24"; CLIENT_NET="10.44.5.0/24" ;;
     6)
-      read -rp "  IP клиента (X.X.X.X/32): " CLIENT_ADDR
-      read -rp "  IP сервера (X.X.X.X/24): " SERVER_ADDR
-      read -rp "  Подсеть NAT (X.X.X.0/24): " CLIENT_NET
-      ;;
-    *)
-      local rnd_octet2 rnd_octet3
-      rnd_octet2=$(rand_range 10 55)
-      rnd_octet3=$(rand_range 1 254)
-      CLIENT_ADDR="10.${rnd_octet2}.${rnd_octet3}.2/32"
-      SERVER_ADDR="10.${rnd_octet2}.${rnd_octet3}.1/24"
-      CLIENT_NET="10.${rnd_octet2}.${rnd_octet3}.0/24"
+      local _ip_re='^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
+      while true; do
+        read -rp "  IP клиента (X.X.X.X/32): " CLIENT_ADDR
+        [[ "$CLIENT_ADDR" =~ $_ip_re ]] && break
+        warn "Формат: 10.1.2.3/32"
+      done
+      while true; do
+        read -rp "  IP сервера (X.X.X.X/24): " SERVER_ADDR
+        [[ "$SERVER_ADDR" =~ $_ip_re ]] && break
+        warn "Формат: 10.1.2.1/24"
+      done
+      while true; do
+        read -rp "  Подсеть NAT (X.X.X.0/24): " CLIENT_NET
+        [[ "$CLIENT_NET" =~ $_ip_re ]] && break
+        warn "Формат: 10.1.2.0/24"
+      done
       ;;
   esac
 
@@ -2007,9 +2251,8 @@ do_gen() {
   echo -e "  ${W}MTU        : ${N}$MTU"
   echo -e "  ${W}Порт       : ${N}$PORT"
   echo ""
-  safe_read CONFIRM "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")"
-  CONFIRM=${CONFIRM:-y}
-  [[ $CONFIRM =~ ^[Yy]$ ]] || { warn "Отменено."; return 0; }
+  read_yesno CONFIRM "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")" "y"
+  [[ "$CONFIRM" == "y" ]] || { warn "Отменено."; return 0; }
 
   local srv_priv srv_pub cli_priv cli_pub psk srv_ip iface
 
@@ -2125,8 +2368,8 @@ do_gen() {
     echo -e "  ${Y}  • Порт $PORT заблокирован → ufw allow $PORT/udp${N}"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
-      safe_read RESTORE_BAK "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" || true
-      if [[ "$RESTORE_BAK" =~ ^[Yy]$ ]]; then
+      read_yesno RESTORE_BAK "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" "n"
+      if [[ "$RESTORE_BAK" == "y" ]]; then
         cp "$bak_ts" "$SERVER_CONF"
         awg-quick up "$SERVER_CONF" 2>/dev/null || true
         ok "Конфиг восстановлен"
@@ -2136,9 +2379,8 @@ do_gen() {
   fi
 
   if command -v ufw &>/dev/null; then
-    safe_read OPEN_UFW "$(echo -e "${C}  Открыть порт $PORT/udp в UFW? [Y/n]: ${N}")"
-    OPEN_UFW=${OPEN_UFW:-y}
-    if [[ $OPEN_UFW =~ ^[Yy]$ ]]; then
+    read_yesno OPEN_UFW "$(echo -e "${C}  Открыть порт $PORT/udp в UFW? [Y/n]: ${N}")" "y"
+    if [[ "$OPEN_UFW" == "y" ]]; then
       ufw allow "${PORT}/udp" comment "AmneziaWG" || true
       ok "Порт ${PORT}/udp открыт в файрволе"
     fi
@@ -2246,7 +2488,7 @@ do_manage_clients() {
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    read -rp "$(echo -e "${C}  Выбор [0-5]: ${N}")" MGMT_CHOICE
+    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client ;;
       2) do_rename_client ;;
@@ -2283,7 +2525,7 @@ do_show_config() {
   local SEL
   local prompt="  Выбор [1-$i] (Enter = 1): "
   [[ $i -eq 1 ]] && prompt="  Выбор [1] (Enter = 1): "
-  read -rp "$(echo -e "${C}${prompt}${N}")" SEL
+  safe_read SEL "$(echo -e "${C}${prompt}${N}")"
   SEL=${SEL:-1}
   [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= i )) || { warn "Неверный выбор"; return 0; }
 
@@ -2308,7 +2550,7 @@ do_rename_client() {
   _mgmt_print_list
 
   local SEL
-  read -rp "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")" SEL
+  safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
   [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
   if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
     warn "Неверный номер"; return 0
@@ -2332,7 +2574,8 @@ do_rename_client() {
   fi
 
   # Бекап + обновление SERVER_CONF
-  local bak="${SERVER_CONF}.pre_rename.$(date +%s)"
+  local bak
+  bak="${SERVER_CONF}.pre_rename.$(date +%s)"
   cp "$SERVER_CONF" "$bak"
 
   # Ищем блок [Peer] с нужным PublicKey и обновляем комментарий
@@ -2409,7 +2652,7 @@ do_delete_client() {
   _mgmt_print_list
 
   local SEL
-  read -rp "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")" SEL
+  safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
   [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
   if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
     warn "Неверный номер"; return 0
@@ -2431,7 +2674,8 @@ do_delete_client() {
   [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
 
   # Бекап
-  local bak="${SERVER_CONF}.pre_delete.$(date +%s)"
+  local bak
+  bak="${SERVER_CONF}.pre_delete.$(date +%s)"
   cp "$SERVER_CONF" "$bak"
 
   # Удаляем peer из runtime
@@ -2521,9 +2765,8 @@ do_add_client() {
   local client_file="/root/${client_name}_awg2.conf"
   if [[ -f "$client_file" ]]; then warn "Файл $client_file уже существует — будет перезаписан"; fi
 
-  safe_read CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")"
-  CONFIRM_IP=${CONFIRM_IP:-y}
-  if [[ ! $CONFIRM_IP =~ ^[Yy]$ ]]; then
+  read_yesno CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")" "y"
+  if [[ "$CONFIRM_IP" != "y" ]]; then
     read -rp "  IP вручную (пример: ${base_ip}.5/32): " client_addr
     [[ -z "$client_addr" ]] && { warn "IP не введён — возврат"; return 0; }
   fi
@@ -2547,8 +2790,7 @@ do_add_client() {
   echo "  7) 1280 (макс. совместимость)"
   echo "  8) Вручную"
   local MTU_SEL
-  read -rp "$(echo -e "${C}  Выбор [1-8] (Enter = 1): ${N}")" MTU_SEL
-  MTU_SEL=${MTU_SEL:-1}
+  read_choice MTU_SEL "$(echo -e "${C}  Выбор [1-8] (Enter = 1): ${N}")" 1 8 1
   case $MTU_SEL in
     1) MTU="$srv_mtu" ;;
     2) MTU=1420 ;;
@@ -2564,15 +2806,13 @@ do_add_client() {
         warn "Некорректный MTU. Нужно число 1280-1500"
       done
       ;;
-    *) MTU="$srv_mtu" ;;
   esac
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
   hdr "⌘  Выбор I1 для клиента"
   echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии)"
   echo "  2) Без I1 (только H/S/Jc обфускация)"
-  read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" I1_SELECT
-  I1_SELECT=${I1_SELECT:-1}
+  read_choice I1_SELECT "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
 
   case $I1_SELECT in
     1)
@@ -2835,7 +3075,7 @@ do_show_qr() {
   else
     prompt_txt="  Выбор [1-$i] (Enter = 1): "
   fi
-  read -rp "$(echo -e "${C}${prompt_txt}${N}")" QR_CHOICE
+  safe_read QR_CHOICE "$(echo -e "${C}${prompt_txt}${N}")"
   QR_CHOICE=${QR_CHOICE:-1}
   if ! [[ "$QR_CHOICE" =~ ^[0-9]+$ ]] || (( QR_CHOICE < 1 || QR_CHOICE > i )); then
     warn "Неверный выбор"; return 0
@@ -2858,7 +3098,7 @@ do_restart() {
     echo -e "  ${Y}→ Затем пункт 2 для создания сервера${N}"
     echo ""
     local CONFIRM_INSTALL
-    safe_read CONFIRM_INSTALL "$(echo -e "${G}  Установить сейчас? [y/N]: ${N}")"
+    read_yesno CONFIRM_INSTALL "$(echo -e "${G}  Установить сейчас? [y/N]: ${N}")" "n"
     case "$CONFIRM_INSTALL" in
       [yY]|[yY][eE][sS])
         do_install
@@ -2980,117 +3220,6 @@ do_reset_server() {
   echo ""
   log_info "do_reset_server: сброс выполнен"
 }
-
-do_debug_cps() {
-  local DEBUG_DIR="/tmp/awg_debug"
-  rm -rf "$DEBUG_DIR"
-  mkdir -p "$DEBUG_DIR"
-
-  echo ""
-  hdr "🔧 DEBUG: генерация всех вариантов CPS"
-  echo -e "  ${C}Папка: ${W}$DEBUG_DIR${N}"
-  echo ""
-
-  local DOMAINS_QUIC=("google.com" "ya.ru" "cloudflare.com")
-  local DOMAINS_SIP=("sipgate.de" "sip.beeline.ru" "sip.ovh.net")
-  local DOMAINS_DNS=("github.com" "yandex.ru" "microsoft.com")
-
-  local total=0 failed=0
-  local domain safe_domain fname out i1 i2 i3 i4 i5 i1_sz i1_preview
-
-  # ── QUIC ──────────────────────────────────────────────
-  info "Генерируем QUIC варианты..."
-  for domain in "${DOMAINS_QUIC[@]}"; do
-    safe_domain="${domain//./_}"
-    fname="${DEBUG_DIR}/quic__${safe_domain}.conf"
-    out=$(gen_cps_i1 "quic" "$domain" 2>/dev/null) || { warn "QUIC $domain — FAIL"; failed=$((failed+1)); continue; }
-    i1=$(echo "$out" | sed -n '1p')
-    i2=$(echo "$out" | sed -n '2p')
-    i3=$(echo "$out" | sed -n '3p')
-    i4=$(echo "$out" | sed -n '4p')
-    i5=$(echo "$out" | sed -n '5p')
-    i1_sz=$(echo "$i1" | grep -oP '(?<=<b 0x)[0-9a-f]+' | awk '{print length/2}')
-    {
-      echo "# AWG Debug — профиль: QUIC  домен: $domain"
-      echo "# I1: Long Header Initial ${i1_sz}B | I2-I5: Short Header 1-RTT"
-      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
-      echo ""
-      echo "I1 = $i1"
-      [[ -n "$i2" ]] && echo "I2 = $i2"
-      [[ -n "$i3" ]] && echo "I3 = $i3"
-      [[ -n "$i4" ]] && echo "I4 = $i4"
-      [[ -n "$i5" ]] && echo "I5 = $i5"
-    } > "$fname"
-    echo -e "  ${G}✓${N} quic__${safe_domain}.conf  I1=${i1_sz}B"
-    total=$((total+1))
-  done
-
-  echo ""
-
-  # ── SIP ───────────────────────────────────────────────
-  info "Генерируем SIP варианты..."
-  for domain in "${DOMAINS_SIP[@]}"; do
-    safe_domain="${domain//./_}"
-    fname="${DEBUG_DIR}/sip__${safe_domain}.conf"
-    out=$(gen_cps_i1 "sip" "$domain" 2>/dev/null) || { warn "SIP $domain — FAIL"; failed=$((failed+1)); continue; }
-    i1=$(echo "$out" | sed -n '1p')
-    i1_sz=$(echo "$i1" | grep -oP '(?<=<b 0x)[0-9a-f]+' | awk '{print length/2}')
-    {
-      echo "# AWG Debug — профиль: SIP  домен/сервер: $domain"
-      echo "# I1: REGISTER запрос ${i1_sz}B | I2-I5: пусто (SIP не повторяется)"
-      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
-      echo ""
-      echo "I1 = $i1"
-    } > "$fname"
-    echo -e "  ${G}✓${N} sip__${safe_domain}.conf  I1=${i1_sz}B"
-    total=$((total+1))
-  done
-
-  echo ""
-
-  # ── DNS ───────────────────────────────────────────────
-  info "Генерируем DNS варианты..."
-  for domain in "${DOMAINS_DNS[@]}"; do
-    safe_domain="${domain//./_}"
-    fname="${DEBUG_DIR}/dns__${safe_domain}.conf"
-    out=$(gen_cps_i1 "dns" "$domain" 2>/dev/null) || { warn "DNS $domain — FAIL"; failed=$((failed+1)); continue; }
-    i1=$(echo "$out" | sed -n '1p')
-    i2=$(echo "$out" | sed -n '2p')
-    i3=$(echo "$out" | sed -n '3p')
-    i4=$(echo "$out" | sed -n '4p')
-    i5=$(echo "$out" | sed -n '5p')
-    {
-      echo "# AWG Debug — профиль: DNS  домен: $domain"
-      echo "# I1-I5: DNS Query с <r 2> TXID prefix, разные домены из пула"
-      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
-      echo ""
-      echo "I1 = $i1"
-      [[ -n "$i2" ]] && echo "I2 = $i2"
-      [[ -n "$i3" ]] && echo "I3 = $i3"
-      [[ -n "$i4" ]] && echo "I4 = $i4"
-      [[ -n "$i5" ]] && echo "I5 = $i5"
-    } > "$fname"
-    i1_preview=$(echo "$i1" | cut -c1-50)
-    echo -e "  ${G}✓${N} dns__${safe_domain}.conf  ${i1_preview}..."
-    total=$((total+1))
-  done
-
-  echo ""
-
-  # ── Итог ──────────────────────────────────────────────
-  hdr "√ DEBUG завершён"
-  echo -e "  Создано файлов : ${G}${total}${N}"
-  [[ $failed -gt 0 ]] && echo -e "  Ошибок         : ${R}${failed}${N}"
-  echo ""
-  echo -e "  ${W}Файлы:${N}"
-  ls -1 "$DEBUG_DIR/"*.conf 2>/dev/null | while read -r f; do
-    echo -e "    ${C}$(basename "$f")${N}"
-  done
-  echo ""
-  echo -e "  ${D}cat $DEBUG_DIR/quic__google_com.conf${N}"
-  log_info "do_debug_cps: создано ${total} файлов в $DEBUG_DIR"
-}
-
 
 # Перенаправляет трафик AWG туннеля через Cloudflare Warp.
 # Поддерживает бесплатный Warp и Warp+ с лицензионным ключом.
@@ -3248,7 +3377,7 @@ _warp_register() {
     info "     export HTTPS_PROXY=http://proxy.example.com:8080"
     info "  3. Использовать готовый wgcf-account.toml с другого сервера"
     echo ""
-    safe_read CONT "$(echo -e "${C}  Продолжить попытку регистрации? [y/N]: ${N}")"
+    read_yesno CONT "$(echo -e "${C}  Продолжить попытку регистрации? [y/N]: ${N}")" "n"
     [[ ! "$CONT" =~ ^[Yy]$ ]] && { warn "Отменено"; return 1; }
   fi
 
@@ -3496,7 +3625,7 @@ _warp_sync_peers() {
   [[ ! -f "$WARP_PEERS" ]] && return 0
   [[ ! -f "$SERVER_CONF" ]] && {
     # Сервер удалён — чистим всё
-    > "$WARP_PEERS"
+    : > "$WARP_PEERS"
     return 0
   }
 
@@ -3505,13 +3634,13 @@ _warp_sync_peers() {
   live_ips=$(_warp_list_awg_clients | awk -F'|' '{print $2}' | sort -u)
 
   if [[ -z "$live_ips" ]]; then
-    > "$WARP_PEERS"
+    : > "$WARP_PEERS"
     return 0
   fi
 
   # Перезаписываем peers.list только теми IP, что есть в live_ips
   local tmp="${WARP_PEERS}.tmp"
-  > "$tmp"
+  : > "$tmp"
   local removed=0
   local ip
   while IFS= read -r ip; do
@@ -4238,7 +4367,8 @@ _warp_import_account() {
   # Бекапим существующий профиль если есть
   mkdir -p "$WARP_DIR"
   if [[ -f "$WARP_PROFILE" ]]; then
-    local bak="${WARP_PROFILE}.bak.$(date +%s)"
+    local bak
+    bak="${WARP_PROFILE}.bak.$(date +%s)"
     cp "$WARP_PROFILE" "$bak"
     info "Старый профиль сохранён: $bak"
   fi
@@ -4293,7 +4423,7 @@ do_warp_menu() {
     echo -e "  ${R}d) Удалить Warp полностью${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    read -rp "$(echo -e "${C}  Выбор [0-9, d]: ${N}")" WARP_CHOICE
+    safe_read WARP_CHOICE "$(echo -e "${C}  Выбор [0-9, d]: ${N}")"
 
     case "${WARP_CHOICE:-}" in
       1)
@@ -4427,7 +4557,7 @@ _dns_proxy_install() {
     info "  • Pi-hole / Unbound / BIND / PowerDNS"
     info "  • Другая инсталляция dnscrypt-proxy"
     echo ""
-    safe_read CONT_INSTALL "$(echo -e "  ${Y}Продолжить установку всё равно? [y/N]: ${N}")"
+    read_yesno CONT_INSTALL "$(echo -e "  ${Y}Продолжить установку всё равно? [y/N]: ${N}")" "n"
     if [[ ! "${CONT_INSTALL,,}" =~ ^y ]]; then
       warn "Отменено"
       return 1
@@ -4821,7 +4951,7 @@ _dns_proxy_remove() {
   echo -e "  ${R}•${N} Persistence (systemd unit) и Healthcheck (timer)"
   echo -e "  ${R}•${N} Сервис dnscrypt-proxy будет ${Y}остановлен${N}"
   echo ""
-  safe_read REMOVE_PKG "$(echo -e "  Также ${R}полностью удалить пакет${N} dnscrypt-proxy? [y/N]: ")"
+  read_yesno REMOVE_PKG "$(echo -e "  Также ${R}полностью удалить пакет${N} dnscrypt-proxy? [y/N]: ")" "n"
 
   # 1. Healthcheck timer
   systemctl disable --now awg-dns-healthcheck.timer 2>/dev/null || true
@@ -5050,7 +5180,7 @@ do_dns_menu() {
     echo -e "  ${R}5) Выключить и удалить${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    read -rp "  Выбор [0-5]: " DNS_CHOICE
+    safe_read DNS_CHOICE "  Выбор [0-5]: "
 
     case "${DNS_CHOICE:-}" in
       1)
@@ -5126,6 +5256,7 @@ do_uninstall() {
 
   echo ""
   ok "Всё удалено"
+  _DEPS_CACHED=""  # сбрасываем кэш — awg больше нет
 }
 
 # Параллельный пинг всех доменов из 4 пулов.
@@ -5170,21 +5301,27 @@ do_check_domains() {
 
   trap 'rm -rf "$tmpdir"; exit 1' INT TERM
 
-  # Параллельный пинг с замером ms
+  # Параллельная проверка через _probe_host (профиль определяет метод: TCP vs ping)
   local domain
-  for domain in "${all_domains[@]}"; do
+  _spawn_probe() {
+    local prof="$1" d="$2"
     (
-      local result
-      # ping -c 1 -W 1 возвращает "time=XX.X ms" при успехе
-      result=$(timeout 2 ping -c 1 -W 1 "$domain" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
-      if [[ -n "$result" ]]; then
-        # Округляем до целого
-        printf "%.0f" "$result" > "$tmpdir/${domain//./_}"
+      local r ms
+      r=$(_probe_host "$prof" "$d")
+      if [[ "$r" == ok* ]]; then
+        ms=${r#ok }
+        # Защита от "0 мс"
+        [[ -z "$ms" || "$ms" == "0" ]] && ms=1
+        echo "$ms" > "$tmpdir/${d//./_}"
       else
-        echo "fail" > "$tmpdir/${domain//./_}"
+        echo "fail" > "$tmpdir/${d//./_}"
       fi
     ) &
-  done
+  }
+  for domain in "${tls_pool[@]}";  do _spawn_probe tls  "$domain"; done
+  for domain in "${dtls_pool[@]}"; do _spawn_probe dtls "$domain"; done
+  for domain in "${sip_pool[@]}";  do _spawn_probe sip  "$domain"; done
+  for domain in "${quic_pool[@]}"; do _spawn_probe quic "$domain"; done
 
   # Защита от пустых пулов
   if [[ $total -eq 0 ]]; then
@@ -5210,7 +5347,7 @@ do_check_domains() {
       local i
       for ((i=0; i<filled; i++)); do bar+="█"; done
       for ((i=filled; i<bar_width; i++)); do bar+="░"; done
-      printf "\r  ${C}Пинг: ${G}%s${N} ${W}%3d%%${N} (${done_count}/${total})" "$bar" "$pct"
+      printf "\r  ${C}Проверка: ${G}%s${N} ${W}%3d%%${N} (${done_count}/${total})" "$bar" "$pct"
       last_done=$done_count
     fi
 
@@ -5307,7 +5444,8 @@ do_clean_clients() {
   awg-quick down "$SERVER_CONF" 2>/dev/null || true
 
   # Backup ДО изменений
-  local clean_bak="${SERVER_CONF}.bak.clean.$(date +%s)"
+  local clean_bak
+  clean_bak="${SERVER_CONF}.bak.clean.$(date +%s)"
   cp "$SERVER_CONF" "$clean_bak" || { err "Не удалось создать backup"; return 1; }
   ok "Резервная копия: $clean_bak"
 
@@ -5439,7 +5577,7 @@ do_restore() {
   echo ""
 
   local RESTORE_CHOICE
-  read -rp "$(echo -e "${C}  Выбери номер бекапа (Enter = 1): ${N}")" RESTORE_CHOICE
+  safe_read RESTORE_CHOICE "$(echo -e "${C}  Выбери номер бекапа (Enter = 1): ${N}")"
   RESTORE_CHOICE=${RESTORE_CHOICE:-1}
 
   if ! [[ "$RESTORE_CHOICE" =~ ^[0-9]+$ ]] || \
@@ -5517,10 +5655,30 @@ AWG_PARAMS_LINES=""
 ERROR_COUNT=0
 
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/awg-manager.log"
-log_info "=== AWG Toolza v6.2 запущен ==="
 
-# Trap EXIT — cleanup временных файлов
-trap 'rm -rf /tmp/awg_tmp_* /tmp/awg_ping_* 2>/dev/null || true' EXIT
+# Ротация лога: если >5MB — переименовываем в .old (оставляем 1 архивный)
+if [[ -f "$LOG_FILE" ]]; then
+  _log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( _log_size > 5242880 )); then
+    mv -f "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+  fi
+  unset _log_size
+fi
+
+log_info "=== AWG Toolza ${VERSION} запущен ==="
+
+# Trap EXIT/INT/TERM — cleanup временных файлов и кэшей
+_global_cleanup() {
+  rm -rf /tmp/awg_tmp_* /tmp/awg_ping_* 2>/dev/null || true
+  # Кэш доменов оставляем (используется повторно в do_check_domains),
+  # удаляем только если он битый (нулевого размера)
+  [[ -f /tmp/awg_domain_cache.txt && ! -s /tmp/awg_domain_cache.txt ]] && \
+    rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
+}
+trap '_global_cleanup' EXIT
+trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
 
 while true; do
   check_deps
@@ -5545,7 +5703,6 @@ while true; do
     14)  do_self_update ;;
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
-    999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
@@ -5555,14 +5712,15 @@ while true; do
       warn "Неверный выбор"
       ERROR_COUNT=$((ERROR_COUNT + 1))
       if [[ $ERROR_COUNT -ge 5 ]]; then
-        err "Слишком много неверных выборов. Выход."
-        log_err "Слишком много неверных выборов — выход"
-        exit 1
+        warn "Слишком много неверных нажатий подряд (${ERROR_COUNT}). Будь внимательнее — проверь раскладку и Caps Lock."
+        log_err "Слишком много неверных выборов подряд (${ERROR_COUNT}) — продолжаем"
+        ERROR_COUNT=0
+        sleep 1
       fi
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 16 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 16 ]]; then
     ERROR_COUNT=0
   fi
 
