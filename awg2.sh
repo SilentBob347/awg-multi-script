@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.3"
+VERSION="v6.8.4"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -342,7 +342,7 @@ _probe_host() {
   else
     # ICMP ping для UDP-only сервисов (STUN/QUIC) — fallback
     local ms
-    ms=$(timeout 2 ping -c 1 -W 1 "$host" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+    ms=$(timeout 2 ping -c 1 -W 1 "$host" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2 || true)
     if [[ -n "$ms" ]]; then
       printf "ok %.0f\n" "$ms"
     else
@@ -3145,16 +3145,16 @@ do_list_clients() {
     elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
       pubkey="${BASH_REMATCH[1]}"
       local transfer_line
-      transfer_line=$(echo "$transfer_cache" | grep -F "$pubkey" | head -1)
+      transfer_line=$(echo "$transfer_cache" | grep -F "$pubkey" | head -1 || true)
       tx_raw=$(echo "$transfer_line" | awk '{print $2}' 2>/dev/null || echo "0")
       rx_raw=$(echo "$transfer_line" | awk '{print $3}' 2>/dev/null || echo "0")
       tx_raw=${tx_raw:-0}
       rx_raw=${rx_raw:-0}
       local hs_line
-      hs_line=$(echo "$handshake_cache" | grep -F "$pubkey" | head -1)
+      hs_line=$(echo "$handshake_cache" | grep -F "$pubkey" | head -1 || true)
       handshake_time=$(echo "$hs_line" | awk '{print $2}' 2>/dev/null || echo "")
       local ep_line
-      ep_line=$(echo "$endpoint_cache" | grep -F "$pubkey" | head -1)
+      ep_line=$(echo "$endpoint_cache" | grep -F "$pubkey" | head -1 || true)
       endpoint=$(echo "$ep_line" | awk '{print $2}' 2>/dev/null || echo "")
     elif [[ "$line" =~ ^AllowedIPs[[:space:]]=[[:space:]](.+) ]]; then
       ip="${BASH_REMATCH[1]}"
@@ -3403,7 +3403,7 @@ do_reset_server() {
   trash "Удаляем UFW правила..."
   if command -v ufw &>/dev/null; then
     local rule_nums
-    rule_nums=$(ufw status numbered 2>/dev/null | grep -i "AmneziaWG" | grep -oE '\[[0-9]+\]' | tr -d '[]' | sort -rn)
+    rule_nums=$(ufw status numbered 2>/dev/null | grep -i "AmneziaWG" | grep -oE '\[[0-9]+\]' | tr -d '[]' | sort -rn || true)
     for num in $rule_nums; do
       echo "y" | ufw --force delete "$num" 2>/dev/null || true
     done
@@ -3641,15 +3641,11 @@ _warp_apply_license() {
   echo ""
   echo -e "  ${W}Где взять лицензионный ключ:${N}"
   echo ""
-  echo -e "  ${G}1)${N} ${W}Cloudflare Zero Trust${N} ${C}(рекомендуется — безлимит до 50 устройств)${N}"
-  echo -e "     ${D}→ https://one.dash.cloudflare.com/sign-up${N}"
-  echo -e "     ${D}→ Networks → Devices → Connect Device → WireGuard${N}"
-  echo ""
-  echo -e "  ${G}2)${N} ${W}Приложение 1.1.1.1${N} (Cloudflare WARP)"
+  echo -e "  ${G}1)${N} ${W}Приложение 1.1.1.1${N} (Cloudflare WARP)"
   echo -e "     ${D}→ Шестерёнка → Аккаунт → Ключ${N}"
-  echo -e "     ${D}→ Бесплатный аккаунт с базовой квотой${N}"
+  echo -e "     ${D}→ Через покупку Warp+ в приложении${N}"
   echo ""
-  echo -e "  ${G}3)${N} ${W}Реферальная программа${N} (если ещё работает)"
+  echo -e "  ${G}2)${N} ${W}Реферальная программа${N} (если ещё работает)"
   echo -e "     ${D}→ В приложении 1.1.1.1 → пригласи друзей${N}"
   echo -e "     ${D}→ +1 ГБ за каждого, до 25 ГБ Warp+ бесплатно${N}"
   echo ""
@@ -3683,31 +3679,31 @@ _warp_apply_license() {
     return 1
   fi
 
-  # Проверяем что лицензия реально дала Warp+ квоту
-  # (защита от мёртвых рефералок — Cloudflare закрыл программу в начале 2025)
-  local account_type premium_data
-  account_type=$(grep -oP 'account_type\s*=\s*"\K[^"]+' wgcf-account.toml 2>/dev/null || echo "")
-  premium_data=$(grep -oP 'premium_data\s*=\s*\K[0-9]+' wgcf-account.toml 2>/dev/null || echo "0")
+  # Проверяем что лицензия реально дала Warp+ квоту.
+  # wgcf не пишет account_type в toml — нужно запрашивать у Cloudflare через `wgcf status`.
+  local account_type status_out
+  status_out=$(wgcf status 2>/dev/null || true)
+  account_type=$(echo "$status_out" | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
 
   echo ""
-  if [[ "$account_type" == "limited" ]] && [[ ${premium_data:-0} -gt 0 ]]; then
-    # premium_data в байтах, переводим в GiB
-    local premium_gb=$(( premium_data / 1024 / 1024 / 1024 ))
-    if [[ $premium_gb -ge 1000 ]]; then
-      ok "Warp+ активирован — ${premium_gb} GiB (фактически безлимит)"
-    else
-      ok "Warp+ активирован — квота ${premium_gb} GiB"
-    fi
-  elif [[ "$account_type" == "unlimited" ]]; then
-    ok "Warp+ Unlimited активирован (Zero Trust)"
-  else
-    warn "Лицензия применилась, но Warp+ квота не появилась"
-    warn "Возможные причины:"
-    warn "  • Ключ от закрытой реферальной программы (Cloudflare закрыл её в 2025)"
-    warn "  • Ключ уже использован на другом устройстве"
-    warn "  • Ключ невалиден"
-    info "Получи рабочий ключ через Zero Trust: https://one.dash.cloudflare.com/sign-up"
-  fi
+  case "$account_type" in
+    unlimited)
+      ok "Warp+ Unlimited активирован"
+      ;;
+    limited|premium)
+      ok "Warp+ активирован (тип: $account_type)"
+      ;;
+    free|"")
+      warn "Лицензия применилась, но Warp+ не активен (тип аккаунта: ${account_type:-неизвестно})"
+      warn "Возможные причины:"
+      warn "  • Ключ уже использован на другом устройстве"
+      warn "  • Ключ невалиден или истёк"
+      warn "  • Cloudflare временно недоступен"
+      ;;
+    *)
+      ok "Warp+ активирован (тип: $account_type)"
+      ;;
+  esac
 
   info "Перегенерируем профиль..."
   wgcf generate 2>/dev/null && cp "$WARP_DIR/wgcf-profile.conf" "$WARP_CONF" 2>/dev/null
@@ -4606,11 +4602,28 @@ _warp_status() {
 
   if [[ -f "$WARP_ACCOUNT" ]]; then
     local lic
-    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2 || true)
+    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d"'" -f2 || true)
+    # Fallback на двойные кавычки (вдруг wgcf поменяет формат)
+    [[ -z "$lic" ]] && lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2 || true)
+
     if [[ -n "$lic" && ${#lic} -gt 10 ]]; then
-      echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
+      # Есть лицензия — спрашиваем у Cloudflare какой тип аккаунта
+      local acc_type
+      acc_type=$(wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
+      case "$acc_type" in
+        unlimited)
+          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+ unlimited)${N}"
+          ;;
+        limited|premium)
+          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
+          ;;
+        *)
+          # Ключ есть, но активация не подтвердилась — показываем нейтрально
+          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${Y}(WARP, ключ не активен)${N}"
+          ;;
+      esac
     else
-      echo -e "  Аккаунт    : ${G}зарегистрирован${N} (бесплатный)"
+      echo -e "  Аккаунт    : ${G}зарегистрирован${N} (WARP)"
     fi
   else
     echo -e "  Аккаунт    : ${D}не зарегистрирован${N}"
@@ -5636,7 +5649,7 @@ do_uninstall() {
   trash "Удаляем UFW правила..."
   if command -v ufw &>/dev/null; then
     local rule_nums
-    rule_nums=$(ufw status numbered 2>/dev/null | grep -i "AmneziaWG" | grep -oE '\[[0-9]+\]' | tr -d '[]' | sort -rn)
+    rule_nums=$(ufw status numbered 2>/dev/null | grep -i "AmneziaWG" | grep -oE '\[[0-9]+\]' | tr -d '[]' | sort -rn || true)
     for num in $rule_nums; do
       echo "y" | ufw --force delete "$num" 2>/dev/null || true
     done
@@ -5970,7 +5983,8 @@ do_restore() {
   for b in "${backups[@]}"; do
     local meta="$b/backup_meta.txt"
     local ts files
-    ts=$(grep "^timestamp=" "$meta" 2>/dev/null | cut -d= -f2 || basename "$b")
+    ts=$(grep "^timestamp=" "$meta" 2>/dev/null | cut -d= -f2 || true)
+    [[ -z "$ts" ]] && ts=$(basename "$b")
     files=$(grep "^backed_files=" "$meta" 2>/dev/null | cut -d= -f2 || echo "?")
     echo -e "  ${G}$i${N}) $ts  (файлов: $files)  [$(basename "$b")]"
     i=$((i + 1))
