@@ -4618,7 +4618,8 @@ _warp_status() {
       fi
       # Fallback: если кеша нет — опрашиваем Cloudflare (только тогда)
       if [[ -z "$acc_type" ]]; then
-        acc_type=$(timeout 5 wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
+        # wgcf status требует wgcf-account.toml в текущей директории
+        acc_type=$(cd "$WARP_DIR" 2>/dev/null && timeout 5 wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
         # Если получили — сохраняем
         [[ -n "$acc_type" ]] && echo "$acc_type" > "$WARP_DIR/account_type" 2>/dev/null || true
       fi
