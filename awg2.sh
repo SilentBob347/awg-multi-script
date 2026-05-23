@@ -2682,16 +2682,18 @@ do_manage_clients() {
     echo -e "  ${R}3)${N} Удалить клиента"
     echo -e "  ${C}4)${N} Показать QR клиента"
     echo -e "  ${C}5)${N} Показать конфиг клиента (текст)"
+    echo -e "  ${G}6)${N} Создать N клиентов (массово)"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
+    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client ;;
       2) do_rename_client ;;
       3) do_delete_client ;;
       4) do_show_qr ;;
       5) do_show_config ;;
+      6) do_bulk_add_clients ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3136,6 +3138,300 @@ do_add_client() {
   echo -e "${W}  Имя    : ${N}$client_name"
   echo -e "${W}  IP     : ${N}$client_addr"
   echo -e "${W}  Конфиг : ${N}$client_file"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Массовое создание клиентов (пункт 6 меню)
+# - Префикс + N клиентов, имя <prefix>-NNN (3 цифры)
+# - DNS, MTU, профиль I1 спрашиваются ОДИН раз
+# - В цикле: find_free_ip, ключи, запись в SERVER_CONF, awg set, файл клиента
+# - _apply_config вызывается ОДИН раз в самом конце (быстро, без гонок)
+# - QR/печать конфигов не выводим (тихо)
+# - SIGINT корректно прерывает и применяет накопленное
+# ─────────────────────────────────────────────────────────────
+do_bulk_add_clients() {
+  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала пункт 2 — возврат"; return 0; }
+  command -v awg &>/dev/null || { warn "awg не найден — возврат"; return 0; }
+  awg show awg0 public-key &>/dev/null || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
+
+  # ── Базовые данные сервера ──
+  local server_net base_ip srv_pub srv_ip port srv_mtu _srv_profile
+  server_net=$(grep "^Address" "$SERVER_CONF" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ' | head -1 || true)
+  base_ip=$(echo "$server_net" | cut -d. -f1-3)
+  [[ -z "$base_ip" ]] && { err "Не удалось определить подсеть сервера"; return 1; }
+
+  srv_pub=$(awg show awg0 public-key 2>/dev/null) || { err "awg0 не поднят"; return 1; }
+  srv_ip=$(get_public_ip)
+  [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
+  port=$(grep "^ListenPort = " "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' || true)
+  [[ -z "$port" ]] && { err "ListenPort не найден в конфиге сервера"; return 1; }
+
+  srv_mtu=$(grep "^MTU = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | head -1 || true)
+  srv_mtu=${srv_mtu:-1320}
+
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  _srv_profile="${_srv_profile:-pro}"
+
+  # ── Подсчёт свободных IP в подсети ──
+  local free_count=0 srv_ip_oct=""
+  srv_ip_oct=$(echo "$server_net" | cut -d/ -f1 | awk -F. '{print $4}' || true)
+  local i
+  for i in $(seq 2 254); do
+    [[ -n "$srv_ip_oct" && "$i" == "$srv_ip_oct" ]] && continue
+    if ! grep -qF "${base_ip}.${i}/32" "$SERVER_CONF" 2>/dev/null; then
+      free_count=$((free_count+1))
+    fi
+  done
+  [[ $free_count -eq 0 ]] && { warn "Свободных IP нет в подсети ${base_ip}.0/24 — возврат"; return 0; }
+
+  echo ""
+  hdr "▣  Массовое создание клиентов"
+  echo -e "  ${D}Подсеть    : ${base_ip}.0/24${N}"
+  echo -e "  ${D}Свободно IP: ${free_count}${N}"
+  echo -e "  ${D}Профиль    : ${_srv_profile}${N}"
+  echo ""
+
+  # ── Префикс ──
+  local prefix
+  read -rp "$(echo -e "${C}  Префикс имени (напр. bulk, user, phone): ${N}")" prefix
+  if [[ -z "$prefix" ]]; then warn "Префикс не может быть пустым — возврат"; return 0; fi
+  if ! [[ "$prefix" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    warn "Префикс содержит недопустимые символы (только A-Z, a-z, 0-9, _, -) — возврат"
+    return 0
+  fi
+
+  # ── Количество ──
+  local count
+  local max_count=$free_count
+  (( max_count > 200 )) && max_count=200
+  while true; do
+    read -rp "$(echo -e "${C}  Сколько клиентов создать [1-${max_count}]: ${N}")" count
+    [[ "$count" =~ ^[0-9]+$ ]] && (( count >= 1 && count <= max_count )) && break
+    warn "Нужно число 1-${max_count}"
+  done
+
+  # ── Пауза ──
+  local pause
+  read -rp "$(echo -e "${C}  Пауза между клиентами, сек (Enter = 1): ${N}")" pause
+  pause=${pause:-1}
+  if ! [[ "$pause" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then warn "Некорректная пауза, ставлю 1"; pause=1; fi
+
+  # ── DNS (один раз для всех) ──
+  choose_dns
+  [[ -z "$CLIENT_DNS" ]] && CLIENT_DNS="1.1.1.1, 1.0.0.1"
+
+  # ── MTU (один раз для всех) ──
+  echo ""
+  hdr "▬  MTU для всех клиентов"
+  echo "  1) $srv_mtu — как у сервера (рекомендуется)"
+  echo "  2) 1420"
+  echo "  3) 1380"
+  echo "  4) 1280 (макс. совместимость)"
+  local MTU_SEL MTU
+  read_choice MTU_SEL "$(echo -e "${C}  Выбор [1-4] (Enter = 1): ${N}")" 1 4 1
+  case $MTU_SEL in
+    1) MTU="$srv_mtu" ;;
+    2) MTU=1420 ;;
+    3) MTU=1380 ;;
+    4) MTU=1280 ;;
+  esac
+
+  # ── I1 (один раз для всех) ──
+  local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
+
+  case "$_srv_profile" in
+    lite)
+      info "Профиль сервера Lite — клиенты получат I1=DNS (icloud.com)"
+      local cps_out
+      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
+      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      ;;
+    standard)
+      info "Профиль сервера Standard — клиенты получат I1=QUIC"
+      local sel_domain cps_out
+      sel_domain=$(select_random_domain "quic")
+      [[ -z "$sel_domain" ]] && sel_domain=""
+      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
+      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      ;;
+    pro|*)
+      hdr "⌘  Выбор I1 для всех клиентов"
+      echo "  1) Сгенерировать I1 (выбор уровня + профиля мимикрии)"
+      echo "  2) Без I1 (только H/S/Jc обфускация, рекомендуется для bulk)"
+      local I1_SELECT
+      read_choice I1_SELECT "$(echo -e "${C}  Выбор [1-2] (Enter = 2): ${N}")" 1 2 2
+      case $I1_SELECT in
+        1)
+          choose_obf_level
+          choose_mimicry_profile
+          [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+          [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
+          [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
+          [[ -n "$I4" ]] && i4_line="I4 = $I4" || i4_line=""
+          [[ -n "$I5" ]] && i5_line="I5 = $I5" || i5_line=""
+          ;;
+        2)
+          i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+          ;;
+      esac
+      ;;
+  esac
+
+  # ── Подтверждение ──
+  echo ""
+  hdr "≡  Готов к запуску"
+  echo -e "  ${W}Префикс   : ${N}${prefix}-NNN"
+  echo -e "  ${W}Количество: ${N}${count}"
+  echo -e "  ${W}Пауза     : ${N}${pause} сек"
+  echo -e "  ${W}DNS       : ${N}${CLIENT_DNS}"
+  echo -e "  ${W}MTU       : ${N}${MTU}"
+  if [[ -n "$i1_line" ]]; then
+    echo -e "  ${W}I1        : ${N}есть (${#I1} сим)"
+  else
+    echo -e "  ${W}I1        : ${N}нет (базовая обфускация)"
+  fi
+  echo ""
+  local CONFIRM
+  read_yesno CONFIRM "$(echo -e "${C}  Создать ${count} клиентов? [Y/n]: ${N}")" "y"
+  [[ "$CONFIRM" != "y" ]] && { info "Отменено"; return 0; }
+
+  # awg-параметры из секции [Interface] сервера — считаем один раз
+  local awg_params_from_srv
+  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " | grep -v "^#" || true)
+
+  # ── SIGINT handler ──
+  _bulk_interrupted=0
+  trap '_bulk_interrupted=1' INT
+
+  # ── Цикл создания ──
+  echo ""
+  local _bulk_created=()
+  local idx=1 created=0 skipped=0
+  local name client_addr client_file cli_priv cli_pub psk psk_tmp suffix candidate candidate_file
+  local name_idx=1
+
+  while (( created < count )); do
+    if (( _bulk_interrupted == 1 )); then
+      warn "Прерывание получено — останавливаю цикл"
+      break
+    fi
+
+    # Подбор уникального имени: prefix-001, prefix-002 ...
+    name=""
+    while (( name_idx <= 9999 )); do
+      printf -v suffix "%03d" "$name_idx"
+      candidate="${prefix}-${suffix}"
+      candidate_file="/root/${candidate}_awg2.conf"
+      if [[ ! -f "$candidate_file" ]] && ! grep -qE "^# ${candidate}$" "$SERVER_CONF" 2>/dev/null; then
+        name="$candidate"
+        name_idx=$((name_idx+1))
+        break
+      fi
+      name_idx=$((name_idx+1))
+    done
+
+    if [[ -z "$name" ]]; then
+      warn "Не удалось подобрать свободное имя — стоп"
+      break
+    fi
+
+    # Свободный IP (учитывает уже добавленных в этом же цикле)
+    client_addr=$(find_free_ip "$base_ip") || { warn "Подсеть заполнена — стоп"; break; }
+
+    # Ключи
+    cli_priv=$(awg genkey)
+    cli_pub=$(echo "$cli_priv" | awg pubkey)
+    psk=$(awg genpsk)
+
+    # Дописываем [Peer] в SERVER_CONF (6 строк: пустая, [Peer], #name, PublicKey, PresharedKey, AllowedIPs)
+    {
+      echo ""
+      echo "[Peer]"
+      echo "# $name"
+      echo "PublicKey = $cli_pub"
+      echo "PresharedKey = $psk"
+      echo "AllowedIPs = $client_addr"
+    } >> "$SERVER_CONF"
+
+    # Добавляем peer в runtime
+    psk_tmp=$(mktemp)
+    chmod 600 "$psk_tmp"
+    echo "$psk" > "$psk_tmp"
+    if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
+      rm -f "$psk_tmp"
+      warn "[${idx}/${count}] ${name}: awg set не удался, откат записи"
+      # Откат: удаляем последние 6 строк из SERVER_CONF
+      local total_lines
+      total_lines=$(wc -l < "$SERVER_CONF")
+      if (( total_lines > 6 )); then
+        head -n $((total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
+      fi
+      skipped=$((skipped+1))
+      idx=$((idx+1))
+      sleep "$pause"
+      continue
+    fi
+    rm -f "$psk_tmp"
+
+    # Файл клиента
+    client_file="/root/${name}_awg2.conf"
+    {
+      echo "[Interface]"
+      echo "PrivateKey = $cli_priv"
+      echo "Address = $client_addr"
+      echo "DNS = $CLIENT_DNS"
+      echo "MTU = $MTU"
+      if [[ -n "$awg_params_from_srv" ]]; then echo "$awg_params_from_srv"; fi
+      [[ -n "$i1_line" ]] && echo "$i1_line"
+      [[ -n "$i2_line" ]] && echo "$i2_line"
+      [[ -n "$i3_line" ]] && echo "$i3_line"
+      [[ -n "$i4_line" ]] && echo "$i4_line"
+      [[ -n "$i5_line" ]] && echo "$i5_line"
+      echo ""
+      echo "[Peer]"
+      echo "PublicKey = $srv_pub"
+      echo "PresharedKey = $psk"
+      echo "Endpoint = $srv_ip:$port"
+      echo "AllowedIPs = 0.0.0.0/0, ::/0"
+      echo "PersistentKeepalive = 25"
+    } > "$client_file"
+    chmod 600 "$client_file"
+
+    _bulk_created+=("$name")
+    created=$((created+1))
+    echo -e "  ${G}[${idx}/${count}]${N} ${name} → ${client_addr}"
+    idx=$((idx+1))
+
+    # Пауза между итерациями (не на последней)
+    if (( created < count )); then
+      sleep "$pause"
+    fi
+  done
+
+  # Снимаем trap
+  trap - INT
+
+  # ── Один apply в конце ──
+  echo ""
+  info "Применяем конфиг (один раз для всех)..."
+  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
+
+  # ── Итоги (тихо: только список + путь) ──
+  echo ""
+  success_box "▣  Готово: создано ${#_bulk_created[@]} из ${count}"
+  if (( skipped > 0 )); then
+    echo -e "${Y}  Пропущено: ${skipped}${N}"
+  fi
+  echo -e "${W}  Папка     : ${N}/root/"
+  echo -e "${W}  Имена     :${N}"
+  local n
+  for n in "${_bulk_created[@]}"; do
+    echo "    • $n"
+  done
 }
 
 do_list_clients() {
