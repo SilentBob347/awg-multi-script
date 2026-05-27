@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.6"
+VERSION="v6.8.7"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -20,6 +20,15 @@ else
   REAL_HOME="/root"
 fi
 BACKUP_DIR="${REAL_HOME}/awg_backup"
+
+# ── Expire-механика (срок действия клиентов) ───────────────
+EXPIRE_CHECK_BIN="/usr/local/bin/awg2-expire-check"
+EXPIRE_SERVICE="/etc/systemd/system/awg2-expire.service"
+EXPIRE_TIMER="/etc/systemd/system/awg2-expire.timer"
+EXPIRE_SUSPEND_IP="127.0.0.2/32"        # AllowedIPs у заблокированных
+EXPIRE_BOT_CONF="/etc/awg-bot.conf"     # для опциональных Telegram-уведомлений
+EXPIRE_STATE_DIR="/var/lib/awg2-expire" # флаги "уже уведомили" по pubkey
+EXPIRE_LOG="/var/log/awg2-expire.log"
 
 [[ $EUID -ne 0 ]] && { echo -e "${R}× Запускай от root${N}"; exit 1; }
 
@@ -2300,6 +2309,10 @@ EOF
   echo ""
   success_box "Установка завершена"
   _DEPS_CACHED=""  # сбрасываем кэш — теперь awg доступен
+
+  # Поднимаем expire-таймер (срок действия клиентов работает с момента установки)
+  _expire_install || true
+
   info "Следующий шаг: пункт меню 2 — Создать сервер"
   break
   done
@@ -2683,10 +2696,11 @@ do_manage_clients() {
     echo -e "  ${C}4)${N} Показать QR клиента"
     echo -e "  ${C}5)${N} Показать конфиг клиента (текст)"
     echo -e "  ${G}6)${N} Создать N клиентов (массово)"
+    echo -e "  ${C}7)${N} Срок действия клиента"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")"
+    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client ;;
       2) do_rename_client ;;
@@ -2694,6 +2708,7 @@ do_manage_clients() {
       4) do_show_qr ;;
       5) do_show_config ;;
       6) do_bulk_add_clients ;;
+      7) do_expire_menu ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2778,48 +2793,71 @@ do_rename_client() {
   cp "$SERVER_CONF" "$bak"
 
   # Ищем блок [Peer] с нужным PublicKey и обновляем комментарий
-  # Если комментарий есть — заменяем, если нет — добавляем после [Peer]
+  # Заменяем ТОЛЬКО комментарий-имя (первый # без = после [Peer]),
+  # служебные комментарии (# expires=, # orig_ips=) НЕ трогаем.
   local tmp_conf
   tmp_conf=$(mktemp)
   awk -v pk="$pk" -v new_name="$new_name" '
-    BEGIN { in_peer=0; peer_buf=""; has_comment=0 }
-    /^\[Peer\]/ {
-      # Сохраняем предыдущий peer блок если был
+    function flush_peer() {
       if (in_peer && peer_buf != "") {
-        printf "%s", peer_buf
+        if (match_pk) {
+          if (name_replaced) {
+            printf "%s", peer_buf
+          } else {
+            # Имя-комментария не было — вставляем сразу после [Peer]
+            sub(/\[Peer\][[:space:]]*\n/, "[Peer]\n# " new_name "\n", peer_buf)
+            printf "%s", peer_buf
+          }
+        } else {
+          printf "%s", peer_buf
+        }
       }
+    }
+    BEGIN { in_peer=0; peer_buf=""; match_pk=0; name_replaced=0 }
+    /^\[Peer\]/ {
+      flush_peer()
       in_peer=1
       peer_buf=$0 "\n"
-      has_comment=0
+      match_pk=0
+      name_replaced=0
       next
     }
     in_peer {
+      # Если эта строка — комментарий-имя (# something без знака =), и мы ещё не заменили
+      if (!name_replaced && match_pk && $0 ~ /^#[[:space:]]+[^=]+$/) {
+        peer_buf = peer_buf "# " new_name "\n"
+        name_replaced=1
+        next
+      }
       peer_buf = peer_buf $0 "\n"
-      if ($0 ~ /^#[[:space:]]/) has_comment=1
       if ($0 ~ /^PublicKey[[:space:]]*=[[:space:]]*/) {
-        # Нашли PublicKey — проверяем совпадение
         line_pk=$0
         sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", line_pk)
         gsub(/[[:space:]]/, "", line_pk)
         tgt=pk
         gsub(/[[:space:]]/, "", tgt)
         if (line_pk == tgt) {
-          # Обновляем комментарий в peer_buf
-          if (has_comment) {
-            # Заменяем существующий # ...
-            gsub(/\n#[[:space:]][^\n]*\n/, "\n# " new_name "\n", peer_buf)
-          } else {
-            # Добавляем # new_name после [Peer]
-            sub(/\[Peer\]\n/, "[Peer]\n# " new_name "\n", peer_buf)
+          match_pk=1
+          # Ретроактивно ищем комментарий-имя в уже накопленном peer_buf
+          if (!name_replaced) {
+            n = split(peer_buf, lines, "\n")
+            new_buf=""
+            for (i=1; i<=n; i++) {
+              if (!name_replaced && lines[i] ~ /^#[[:space:]]+[^=]+$/) {
+                new_buf = new_buf "# " new_name (i<n ? "\n" : "")
+                name_replaced=1
+              } else {
+                new_buf = new_buf lines[i] (i<n ? "\n" : "")
+              }
+            }
+            peer_buf = new_buf
           }
         }
       }
       next
     }
     { print }
-    END {
-      if (in_peer && peer_buf != "") printf "%s", peer_buf
-    }
+    END { flush_peer() }
   ' "$SERVER_CONF" > "$tmp_conf"
 
   if [[ ! -s "$tmp_conf" ]]; then
@@ -2927,6 +2965,13 @@ do_delete_client() {
   if [[ -f "$del_file" && "$del_name" != "безымянный" ]]; then
     rm -f "$del_file"
     ok "Файл удалён: $(basename "$del_file")"
+  fi
+
+  # Чистим expire-warn флаг если был
+  if [[ -d "$EXPIRE_STATE_DIR" ]]; then
+    local safe_pk
+    safe_pk=$(echo "$del_pk" | tr -c 'A-Za-z0-9' '_')
+    rm -f "${EXPIRE_STATE_DIR}/warn1h_${safe_pk}" 2>/dev/null || true
   fi
 
   ok "Клиент удалён: $del_name ($del_ip)"
@@ -3130,6 +3175,19 @@ do_add_client() {
   info "Применяем конфиг..."
   _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
 
+  # Срок действия (после создания, по согласованному UX)
+  local _expire_ts
+  _expire_ts=$(_expire_ask_at_creation)
+  if [[ -n "$_expire_ts" ]]; then
+    _expire_install
+    if _expire_set_client "$client_name" "$_expire_ts"; then
+      _expire_apply >/dev/null 2>&1 || true
+      ok "Срок действия: $(_expire_fmt "$_expire_ts")"
+    else
+      warn "Не удалось записать срок (клиент создан, но бессрочный)"
+    fi
+  fi
+
   # Раздача конфига (QR без I1-I5 или текст)
   _share_config "$client_file"
 
@@ -3281,6 +3339,10 @@ do_bulk_add_clients() {
       ;;
   esac
 
+  # ── Срок действия (общий для всей пачки) ──
+  local _bulk_expire_ts
+  _bulk_expire_ts=$(_expire_ask_at_creation)
+
   # ── Подтверждение ──
   echo ""
   hdr "≡  Готов к запуску"
@@ -3293,6 +3355,11 @@ do_bulk_add_clients() {
     echo -e "  ${W}I1        : ${N}есть (${#I1} сим)"
   else
     echo -e "  ${W}I1        : ${N}нет (базовая обфускация)"
+  fi
+  if [[ -n "$_bulk_expire_ts" ]]; then
+    echo -e "  ${W}Срок      : ${N}$(_expire_fmt "$_bulk_expire_ts")"
+  else
+    echo -e "  ${W}Срок      : ${N}бессрочно"
   fi
   echo ""
   local CONFIRM
@@ -3419,6 +3486,17 @@ do_bulk_add_clients() {
   echo ""
   info "Применяем конфиг (один раз для всех)..."
   _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
+
+  # Применяем срок ко всем созданным (если указан)
+  if [[ -n "$_bulk_expire_ts" && ${#_bulk_created[@]} -gt 0 ]]; then
+    _expire_install
+    local _n
+    for _n in "${_bulk_created[@]}"; do
+      _expire_set_client "$_n" "$_bulk_expire_ts" >/dev/null 2>&1 || true
+    done
+    _expire_apply >/dev/null 2>&1 || true
+    info "Срок применён ко всем: $(_expire_fmt "$_bulk_expire_ts")"
+  fi
 
   # ── Итоги (тихо: только список + путь) ──
   echo ""
@@ -5967,6 +6045,9 @@ do_uninstall() {
   awg-quick down "$SERVER_CONF" 2>/dev/null || \
     ip link delete dev awg0 2>/dev/null || true
 
+  trash "Удаляем expire-таймер..."
+  _expire_remove || true
+
   trash "Отключаем автозапуск..."
   systemctl disable awg-quick@awg0 2>/dev/null || true
   rm -rf /etc/systemd/system/awg-quick@awg0.service.d 2>/dev/null || true
@@ -7474,6 +7555,715 @@ do_cascade_menu() {
     esac
   done
   set -e
+}
+
+# ═══════════════════════════════════════════════════════════
+# Expire-механика: срок действия клиентов
+# ═══════════════════════════════════════════════════════════
+
+# Установить expire-инфраструктуру (timer + проверочный скрипт)
+_expire_install() {
+  # Идемпотентность
+  if systemctl is-active --quiet awg2-expire.timer 2>/dev/null && \
+     [[ -x "$EXPIRE_CHECK_BIN" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$EXPIRE_STATE_DIR" 2>/dev/null || true
+  touch "$EXPIRE_LOG" 2>/dev/null || true
+  chmod 600 "$EXPIRE_LOG" 2>/dev/null || true
+
+  cat > "$EXPIRE_CHECK_BIN" << 'EXPIRE_EOF'
+#!/bin/bash
+# awg2-expire-check — проверяет peer'ы со сроком действия
+# Запускается из awg2-expire.timer раз в минуту.
+set -uo pipefail
+
+SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+SUSPEND_IP="127.0.0.2/32"
+BOT_CONF="/etc/awg-bot.conf"
+LOG="/var/log/awg2-expire.log"
+STATE_DIR="/var/lib/awg2-expire"
+
+[[ ! -f "$SERVER_CONF" ]] && exit 0
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+notify_tg() {
+  # Опциональное уведомление — молча выходим если бот не настроен
+  [[ ! -f "$BOT_CONF" ]] && return 0
+  local token chat_id text="$1"
+  token=$(grep -E '^BOT_TOKEN=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
+  chat_id=$(grep -E '^ADMIN_CHAT_ID=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
+  [[ -z "$token" || -z "$chat_id" ]] && return 0
+  curl -sf --max-time 5 "https://api.telegram.org/bot${token}/sendMessage" \
+    -d "chat_id=${chat_id}" \
+    -d "parse_mode=HTML" \
+    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+# Питон делает всю работу: парсит, мутирует конфиг атомарно, syncconf, conntrack
+events=$(python3 - "$SERVER_CONF" "$SUSPEND_IP" "$STATE_DIR" << 'PYEOF' 2>>"$LOG"
+import sys, re, os, time, subprocess, pathlib, tempfile
+
+conf_path, suspend, state_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+now = int(time.time())
+
+try:
+    text = pathlib.Path(conf_path).read_text()
+except Exception as e:
+    print(f"# read failed: {e}", file=sys.stderr)
+    sys.exit(0)
+
+# Header (до первого [Peer]) + список peer-блоков
+parts  = re.split(r'(?=\[Peer\])', text)
+header = parts[0]
+peers  = parts[1:]
+
+changed = False
+events_expired = []   # (name, orig_ip)
+events_warn1h  = []   # (name, mins_left)
+
+new_peers = []
+for block in peers:
+    name_m   = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    expire_m = re.search(r'^#\s*expires=(\d+)\s*$', block, re.M)
+    orig_m   = re.search(r'^#\s*orig_ips=(.+?)\s*$', block, re.M)
+    pk_m     = re.search(r'^PublicKey\s*=\s*(\S+)', block, re.M)
+    aip_m    = re.search(r'^AllowedIPs\s*=\s*(.+?)\s*$', block, re.M)
+
+    if not (expire_m and pk_m and aip_m):
+        new_peers.append(block); continue
+
+    expires    = int(expire_m.group(1))
+    pubkey     = pk_m.group(1)
+    current_ip = aip_m.group(1).strip()
+    name       = name_m.group(1) if name_m else pubkey[:8]
+    is_suspended = (current_ip == suspend)
+
+    # Истёк и ещё не заблокирован → блокируем
+    if now >= expires and not is_suspended:
+        # Сохраняем оригинальный IP, если ещё не сохранён
+        if not orig_m:
+            block = re.sub(
+                r'(^#\s*expires=\d+\s*$)',
+                lambda m: m.group(1) + '\n# orig_ips=' + current_ip,
+                block, count=1, flags=re.M
+            )
+        # Меняем AllowedIPs на suspend
+        block = re.sub(
+            r'^(AllowedIPs\s*=\s*).+$',
+            r'\g<1>' + suspend,
+            block, count=1, flags=re.M
+        )
+        changed = True
+        events_expired.append((name, pubkey, current_ip))
+
+    # Не истёк, осталось <= 60 мин → предупреждение (один раз на peer)
+    elif not is_suspended and 0 < (expires - now) <= 3600:
+        safe_pk   = re.sub(r'[^A-Za-z0-9]', '_', pubkey)
+        lock_file = os.path.join(state_dir, f"warn1h_{safe_pk}")
+        if not os.path.exists(lock_file):
+            mins_left = max(1, (expires - now) // 60)
+            events_warn1h.append((name, mins_left))
+            try:
+                pathlib.Path(lock_file).write_text(str(now))
+            except Exception:
+                pass
+
+    new_peers.append(block)
+
+# Атомарная запись конфига если были изменения
+if changed:
+    new_text = header + ''.join(new_peers)
+    try:
+        d   = os.path.dirname(conf_path)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(new_text)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, conf_path)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+    except Exception as e:
+        print(f"# write failed: {e}", file=sys.stderr)
+        sys.exit(0)
+
+    # syncconf — применяет без рестарта (другие peer'ы не рвутся)
+    try:
+        r = subprocess.run(['awg-quick', 'strip', 'awg0'],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            subprocess.run(['awg', 'syncconf', 'awg0', '/dev/stdin'],
+                           input=r.stdout, text=True, timeout=10,
+                           capture_output=True)
+    except Exception as e:
+        print(f"# syncconf failed: {e}", file=sys.stderr)
+
+    # conntrack flush для каждого истёкшего (если conntrack доступен)
+    if subprocess.run(['which', 'conntrack'], capture_output=True).returncode == 0:
+        for name, pk, ip in events_expired:
+            ip_only = ip.split('/')[0].split(',')[0].strip()
+            if ip_only:
+                try:
+                    subprocess.run(['conntrack', '-D', '-s', ip_only],
+                                   capture_output=True, timeout=5)
+                except Exception:
+                    pass
+
+# События для bash-обёртки (TAB-separated)
+for name, pk, ip in events_expired:
+    print(f"EXPIRED\t{name}\t{ip}")
+for name, mins in events_warn1h:
+    print(f"WARN1H\t{name}\t{mins}")
+PYEOF
+)
+
+# Шлём уведомления и пишем в лог
+if [[ -n "$events" ]]; then
+  while IFS=$'\t' read -r evt name arg; do
+    case "$evt" in
+      EXPIRED)
+        log "expired: $name (was $arg)"
+        notify_tg "🚫 Клиент <b>${name}</b> заблокирован: срок действия истёк."
+        ;;
+      WARN1H)
+        log "warn1h: $name (${arg} min left)"
+        notify_tg "⚠️ Клиент <b>${name}</b> истекает через ${arg} мин."
+        ;;
+    esac
+  done <<< "$events"
+fi
+
+exit 0
+EXPIRE_EOF
+
+  chmod +x "$EXPIRE_CHECK_BIN"
+
+  cat > "$EXPIRE_SERVICE" << EOF
+[Unit]
+Description=AWG Toolza — проверка сроков клиентов
+After=awg-quick@awg0.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$EXPIRE_CHECK_BIN
+EOF
+
+  cat > "$EXPIRE_TIMER" << 'EOF'
+[Unit]
+Description=AWG Toolza — таймер проверки сроков
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now awg2-expire.timer >/dev/null 2>&1
+  if systemctl is-active --quiet awg2-expire.timer 2>/dev/null; then
+    ok "Expire-таймер установлен (проверка раз в минуту)"
+  else
+    warn "Expire-таймер не запустился — проверь: systemctl status awg2-expire.timer"
+  fi
+}
+
+# Удаление expire-инфраструктуры (вызывается из do_uninstall)
+_expire_remove() {
+  systemctl disable --now awg2-expire.timer >/dev/null 2>&1 || true
+  rm -f "$EXPIRE_SERVICE" "$EXPIRE_TIMER" "$EXPIRE_CHECK_BIN"
+  rm -rf "$EXPIRE_STATE_DIR"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# Конвертация "1h" / "6h" / "1d" / "7d" / "30d" / "YYYY-MM-DD HH:MM" в unix-ts
+# Возвращает unix-ts на stdout, либо пустую строку при ошибке.
+_expire_parse_duration() {
+  local input="$1" ts=""
+  input="${input// /}"
+  if [[ "$input" =~ ^([0-9]+)h$ ]]; then
+    ts=$(date -d "+${BASH_REMATCH[1]} hours" +%s 2>/dev/null || true)
+  elif [[ "$input" =~ ^([0-9]+)d$ ]]; then
+    ts=$(date -d "+${BASH_REMATCH[1]} days" +%s 2>/dev/null || true)
+  elif [[ "$input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2})?$ ]]; then
+    # Заменяем T на пробел для date
+    ts=$(date -d "${input/T/ }" +%s 2>/dev/null || true)
+  fi
+  echo "$ts"
+}
+
+# Прочитать у клиента expire_ts и orig_ips. Stdout: "<expire_ts>|<orig_ips>"
+# Если нет expires — пустая строка.
+_expire_get_client() {
+  local name="$1"
+  python3 - "$SERVER_CONF" "$name" << 'PYEOF' 2>/dev/null
+import sys, re, pathlib
+conf, target = sys.argv[1], sys.argv[2]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception:
+    sys.exit(0)
+for block in re.split(r'(?=\[Peer\])', text)[1:]:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if not nm or nm.group(1) != target: continue
+    exp = re.search(r'^#\s*expires=(\d+)\s*$', block, re.M)
+    orig = re.search(r'^#\s*orig_ips=(.+?)\s*$', block, re.M)
+    print(f"{exp.group(1) if exp else ''}|{orig.group(1).strip() if orig else ''}")
+    break
+PYEOF
+}
+
+# Установить срок действия клиенту: вписать # expires=<ts> в peer-блок.
+# Если строка уже есть — заменить. Если нет — вставить после "# <name>".
+# Аргументы: client_name expire_ts
+_expire_set_client() {
+  local name="$1" ts="$2"
+  python3 - "$SERVER_CONF" "$name" "$ts" << 'PYEOF'
+import sys, re, os, pathlib, tempfile
+conf, target, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception as e:
+    print(f"read failed: {e}", file=sys.stderr); sys.exit(1)
+
+parts  = re.split(r'(?=\[Peer\])', text)
+header, peers = parts[0], parts[1:]
+
+found = False
+out_peers = []
+for block in peers:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if nm and nm.group(1) == target:
+        found = True
+        if re.search(r'^#\s*expires=\d+\s*$', block, re.M):
+            block = re.sub(r'^#\s*expires=\d+\s*$', f'# expires={ts}', block, count=1, flags=re.M)
+        else:
+            # Вставляем после "# <name>"
+            block = re.sub(
+                r'(^#\s+' + re.escape(target) + r'\s*$)',
+                lambda m: m.group(1) + f'\n# expires={ts}',
+                block, count=1, flags=re.M
+            )
+    out_peers.append(block)
+
+if not found:
+    print("client not found", file=sys.stderr); sys.exit(2)
+
+new_text = header + ''.join(out_peers)
+d  = os.path.dirname(conf)
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f: f.write(new_text)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, conf)
+except Exception as e:
+    try: os.unlink(tmp)
+    except: pass
+    print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
+PYEOF
+}
+
+# Снять срок действия (удалить # expires= и # orig_ips=).
+# Если клиент был suspended — также вернуть оригинальный IP.
+_expire_clear_client() {
+  local name="$1"
+  python3 - "$SERVER_CONF" "$name" "$EXPIRE_SUSPEND_IP" << 'PYEOF'
+import sys, re, os, pathlib, tempfile
+conf, target, suspend = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception as e:
+    print(f"read failed: {e}", file=sys.stderr); sys.exit(1)
+
+parts  = re.split(r'(?=\[Peer\])', text)
+header, peers = parts[0], parts[1:]
+
+found = False
+out_peers = []
+for block in peers:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if nm and nm.group(1) == target:
+        found = True
+        # Восстановить IP, если был suspended
+        orig_m = re.search(r'^#\s*orig_ips=(.+?)\s*$', block, re.M)
+        aip_m  = re.search(r'^AllowedIPs\s*=\s*(.+?)\s*$', block, re.M)
+        if orig_m and aip_m and aip_m.group(1).strip() == suspend:
+            block = re.sub(
+                r'^(AllowedIPs\s*=\s*).+$',
+                r'\g<1>' + orig_m.group(1).strip(),
+                block, count=1, flags=re.M
+            )
+        # Удалить служебные комментарии
+        block = re.sub(r'^#\s*expires=\d+\s*\n', '', block, flags=re.M)
+        block = re.sub(r'^#\s*orig_ips=.+?\s*\n', '', block, flags=re.M)
+    out_peers.append(block)
+
+if not found:
+    print("client not found", file=sys.stderr); sys.exit(2)
+
+new_text = header + ''.join(out_peers)
+d = os.path.dirname(conf)
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f: f.write(new_text)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, conf)
+except Exception as e:
+    try: os.unlink(tmp)
+    except: pass
+    print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
+PYEOF
+}
+
+# Применить изменения серверного конфига через syncconf (без рестарта awg0)
+_expire_apply() {
+  local strip_out
+  strip_out=$(awg-quick strip awg0 2>/dev/null) || return 1
+  echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null
+}
+
+# Форматирование unix-ts в человеческий вид (TZ сервера) + сколько осталось
+_expire_fmt() {
+  local ts="$1" now diff abs_diff sign
+  now=$(date +%s)
+  diff=$((ts - now))
+  if (( diff >= 0 )); then
+    sign="через"; abs_diff=$diff
+  else
+    sign="истёк"; abs_diff=$(( -diff ))
+  fi
+  local d=$(( abs_diff / 86400 ))
+  local h=$(( (abs_diff % 86400) / 3600 ))
+  local m=$(( (abs_diff % 3600) / 60 ))
+  local human=""
+  (( d > 0 )) && human="${d}д "
+  (( h > 0 )) && human="${human}${h}ч "
+  (( m > 0 || (d == 0 && h == 0) )) && human="${human}${m}м"
+  human="${human% }"
+  local when
+  when=$(date -d "@$ts" '+%d.%m.%Y %H:%M %Z' 2>/dev/null || echo "ts=$ts")
+  if [[ "$sign" == "истёк" ]]; then
+    echo "$when (истёк ${human} назад)"
+  else
+    echo "$when (через ${human})"
+  fi
+}
+
+# Меню срока действия клиента (пункт 7 в do_manage_clients)
+do_expire_menu() {
+  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден"; return 0; }
+
+  # Гарантируем что инфраструктура установлена
+  _expire_install
+
+  while true; do
+    echo ""
+    hdr "⏰  Срок действия клиента"
+    echo -e "  ${G}1)${N} Поставить срок клиенту"
+    echo -e "  ${G}2)${N} Снять срок (сделать бессрочным)"
+    echo -e "  ${C}3)${N} Разблокировать просроченного (вернуть IP)"
+    echo -e "  ${C}4)${N} Показать всех со сроками"
+    echo -e "  ${R}5)${N} Удалить всех просроченных навсегда"
+    echo -e "  ${W}0)${N} Назад"
+    echo ""
+    local EXP_CHOICE
+    safe_read EXP_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
+    case "${EXP_CHOICE:-}" in
+      1) _expire_action_set ;;
+      2) _expire_action_clear ;;
+      3) _expire_action_unban ;;
+      4) _expire_action_list ;;
+      5) _expire_action_purge ;;
+      0) return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" _ || return 0
+  done
+}
+
+# Выбор клиента из списка → echo в stdout. Возвращает 1 если отменено.
+_expire_pick_client() {
+  local names=()
+  mapfile -t names < <(
+    grep -E '^#\s+\S+\s*$' "$SERVER_CONF" 2>/dev/null | \
+      awk '{print $2}' | awk 'NF' | sort -u
+  )
+  if [[ ${#names[@]} -eq 0 ]]; then
+    warn "Клиентов не найдено" >&2
+    return 1
+  fi
+  echo "" >&2
+  echo -e "${W}  Клиенты:${N}" >&2
+  local i=0
+  for n in "${names[@]}"; do
+    i=$((i+1))
+    # Статус: бессрочный / с дедлайном / заблокирован
+    local info_line
+    info_line=$(_expire_get_client "$n")
+    if [[ -z "$info_line" ]]; then
+      echo -e "  ${C}$i)${N} $n  ${D}(бессрочный)${N}" >&2
+    else
+      local exp_ts="${info_line%%|*}"
+      local orig_ip="${info_line#*|}"
+      if [[ -n "$exp_ts" ]]; then
+        if [[ -n "$orig_ip" ]]; then
+          echo -e "  ${C}$i)${N} $n  ${R}🚫 заблокирован${N} ${D}($(_expire_fmt "$exp_ts"))${N}" >&2
+        else
+          echo -e "  ${C}$i)${N} $n  ${Y}⏰${N} ${D}$(_expire_fmt "$exp_ts")${N}" >&2
+        fi
+      else
+        echo -e "  ${C}$i)${N} $n  ${D}(бессрочный)${N}" >&2
+      fi
+    fi
+  done
+  echo "" >&2
+  local SEL
+  safe_read SEL "$(echo -e "${C}  Номер клиента [1-$i] (Enter — отмена): ${N}")" >&2
+  [[ -z "$SEL" ]] && return 1
+  [[ ! "$SEL" =~ ^[0-9]+$ ]] && { warn "Неверный номер" >&2; return 1; }
+  (( SEL < 1 || SEL > i )) && { warn "Номер вне диапазона" >&2; return 1; }
+  echo "${names[$((SEL-1))]}"
+  return 0
+}
+
+_expire_action_set() {
+  local client
+  client=$(_expire_pick_client) || return 0
+
+  echo ""
+  echo -e "  ${W}На сколько поставить срок?${N}"
+  echo -e "  ${C}1)${N} 1 час"
+  echo -e "  ${C}2)${N} 6 часов"
+  echo -e "  ${C}3)${N} 1 день"
+  echo -e "  ${C}4)${N} 3 дня"
+  echo -e "  ${C}5)${N} 7 дней"
+  echo -e "  ${C}6)${N} 30 дней"
+  echo -e "  ${C}7)${N} Своя дата (YYYY-MM-DD HH:MM)"
+  echo ""
+  local PRESET
+  safe_read PRESET "$(echo -e "${C}  Выбор [1-7]: ${N}")"
+
+  local ts=""
+  case "${PRESET:-}" in
+    1) ts=$(_expire_parse_duration "1h") ;;
+    2) ts=$(_expire_parse_duration "6h") ;;
+    3) ts=$(_expire_parse_duration "1d") ;;
+    4) ts=$(_expire_parse_duration "3d") ;;
+    5) ts=$(_expire_parse_duration "7d") ;;
+    6) ts=$(_expire_parse_duration "30d") ;;
+    7)
+       local CUSTOM
+       safe_read CUSTOM "$(echo -e "${C}  Дата (например: 2025-12-31 23:59): ${N}")"
+       ts=$(date -d "$CUSTOM" +%s 2>/dev/null || true)
+       ;;
+    *) warn "Неверный выбор"; return 0 ;;
+  esac
+
+  if [[ -z "$ts" ]]; then
+    warn "Не удалось определить дату — отмена"
+    return 0
+  fi
+
+  local now_ts; now_ts=$(date +%s)
+  if (( ts <= now_ts + 3540 )); then
+    warn "Минимум 1 час от текущего времени"
+    return 0
+  fi
+
+  if _expire_set_client "$client" "$ts"; then
+    ok "Срок установлен: $client → $(_expire_fmt "$ts")"
+    _expire_apply >/dev/null 2>&1 || warn "syncconf не удался — нужен restart awg0"
+    # Сбрасываем флаг "уже предупредили за 1ч" если был
+    local safe_pk
+    safe_pk=$(grep -A2 "^#\s\+$client\s*$" "$SERVER_CONF" 2>/dev/null | \
+              grep "^PublicKey" | head -1 | awk -F= '{print $2}' | tr -d ' ' | tr -c 'A-Za-z0-9' '_' || true)
+    [[ -n "$safe_pk" ]] && rm -f "${EXPIRE_STATE_DIR}/warn1h_${safe_pk}" 2>/dev/null || true
+  else
+    err "Не удалось установить срок"
+  fi
+}
+
+_expire_action_clear() {
+  local client
+  client=$(_expire_pick_client) || return 0
+
+  if _expire_clear_client "$client"; then
+    ok "Срок снят: $client теперь бессрочный"
+    _expire_apply >/dev/null 2>&1 || warn "syncconf не удался — нужен restart awg0"
+  else
+    err "Не удалось снять срок"
+  fi
+}
+
+_expire_action_unban() {
+  local client info_line exp_ts orig_ip
+  client=$(_expire_pick_client) || return 0
+  info_line=$(_expire_get_client "$client")
+  exp_ts="${info_line%%|*}"
+  orig_ip="${info_line#*|}"
+
+  if [[ -z "$exp_ts" || -z "$orig_ip" ]]; then
+    warn "$client не заблокирован сроком (нет orig_ips)"
+    return 0
+  fi
+
+  # Разблокировка = просто снять срок (вернёт оригинальный IP)
+  if _expire_clear_client "$client"; then
+    ok "Разблокирован: $client (IP восстановлен: $orig_ip)"
+    _expire_apply >/dev/null 2>&1 || warn "syncconf не удался — нужен restart awg0"
+  else
+    err "Не удалось разблокировать"
+  fi
+}
+
+_expire_action_list() {
+  echo ""
+  echo -e "${W}  Клиенты со сроком действия:${N}"
+  echo ""
+  local names=() found=0
+  mapfile -t names < <(
+    grep -E '^#\s+\S+\s*$' "$SERVER_CONF" 2>/dev/null | \
+      awk '{print $2}' | awk 'NF' | sort -u
+  )
+  printf "  %-20s  %-10s  %s\n" "ИМЯ" "СТАТУС" "ДЕДЛАЙН"
+  printf "  %-20s  %-10s  %s\n" "────────────────────" "──────────" "──────────────────────────────"
+  for n in "${names[@]}"; do
+    local info_line exp_ts orig_ip status
+    info_line=$(_expire_get_client "$n")
+    [[ -z "$info_line" ]] && continue
+    exp_ts="${info_line%%|*}"
+    orig_ip="${info_line#*|}"
+    [[ -z "$exp_ts" ]] && continue
+    found=$((found+1))
+    if [[ -n "$orig_ip" ]]; then
+      status="🚫 blocked"
+    else
+      status="⏰ active"
+    fi
+    printf "  %-20s  %-10s  %s\n" "$n" "$status" "$(_expire_fmt "$exp_ts")"
+  done
+  echo ""
+  if [[ $found -eq 0 ]]; then
+    info "Нет клиентов со сроком действия — все бессрочные"
+  else
+    info "Всего со сроком: $found"
+  fi
+}
+
+_expire_action_purge() {
+  local names=() to_remove=()
+  mapfile -t names < <(
+    grep -E '^#\s+\S+\s*$' "$SERVER_CONF" 2>/dev/null | \
+      awk '{print $2}' | awk 'NF' | sort -u
+  )
+  local now_ts; now_ts=$(date +%s)
+  for n in "${names[@]}"; do
+    local info_line exp_ts orig_ip
+    info_line=$(_expire_get_client "$n")
+    [[ -z "$info_line" ]] && continue
+    exp_ts="${info_line%%|*}"
+    orig_ip="${info_line#*|}"
+    [[ -z "$exp_ts" ]] && continue
+    if (( exp_ts <= now_ts )) && [[ -n "$orig_ip" ]]; then
+      to_remove+=("$n")
+    fi
+  done
+
+  if [[ ${#to_remove[@]} -eq 0 ]]; then
+    info "Нет просроченных клиентов для удаления"
+    return 0
+  fi
+
+  echo ""
+  warn "Будут удалены НАВСЕГДА:"
+  for n in "${to_remove[@]}"; do
+    echo -e "  ${R}—${N} $n"
+  done
+  echo ""
+  local CONFIRM
+  read_yesno CONFIRM "$(echo -e "${R}  Подтверди удаление [yes/N]: ${N}")" "n"
+  [[ "$CONFIRM" != "y" ]] && { warn "Отменено"; return 0; }
+
+  # Используем существующую do_delete_client логику если возможно,
+  # но проще удалить напрямую через python (peer-блок + клиентский файл)
+  for n in "${to_remove[@]}"; do
+    python3 - "$SERVER_CONF" "$n" << 'PYEOF'
+import sys, re, os, pathlib, tempfile
+conf, target = sys.argv[1], sys.argv[2]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception:
+    sys.exit(1)
+parts  = re.split(r'(?=\[Peer\])', text)
+header, peers = parts[0], parts[1:]
+new_peers = []
+removed_pubkey = None
+for block in peers:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if nm and nm.group(1) == target:
+        pk = re.search(r'^PublicKey\s*=\s*(\S+)', block, re.M)
+        if pk: removed_pubkey = pk.group(1)
+        continue
+    new_peers.append(block)
+new_text = header + ''.join(new_peers)
+d = os.path.dirname(conf)
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f: f.write(new_text)
+os.chmod(tmp, 0o600)
+os.rename(tmp, conf)
+if removed_pubkey:
+    print(removed_pubkey)
+PYEOF
+    local cli_file="/root/${n}_awg2.conf"
+    [[ -f "$cli_file" ]] && rm -f "$cli_file"
+    ok "Удалён: $n"
+  done
+
+  _expire_apply >/dev/null 2>&1 || warn "syncconf не удался — нужен restart awg0"
+  ok "Удалено: ${#to_remove[@]}"
+}
+
+# Спросить срок при создании клиента (вызывается из do_add_client/do_bulk_add_clients)
+# Stdout: unix-ts (или пусто = бессрочный)
+_expire_ask_at_creation() {
+  echo "" >&2
+  echo -e "${W}  Срок действия клиента:${N}" >&2
+  echo -e "  ${C}1)${N} Бессрочно (по умолчанию)" >&2
+  echo -e "  ${C}2)${N} 1 час" >&2
+  echo -e "  ${C}3)${N} 1 день" >&2
+  echo -e "  ${C}4)${N} 7 дней" >&2
+  echo -e "  ${C}5)${N} 30 дней" >&2
+  echo -e "  ${C}6)${N} Своя дата (YYYY-MM-DD HH:MM)" >&2
+  echo "" >&2
+  local CH
+  safe_read CH "$(echo -e "${C}  Выбор [1-6] (Enter = 1): ${N}")" >&2
+  CH="${CH:-1}"
+  local ts=""
+  case "$CH" in
+    1) echo ""; return 0 ;;
+    2) ts=$(_expire_parse_duration "1h") ;;
+    3) ts=$(_expire_parse_duration "1d") ;;
+    4) ts=$(_expire_parse_duration "7d") ;;
+    5) ts=$(_expire_parse_duration "30d") ;;
+    6)
+       local CUSTOM
+       safe_read CUSTOM "$(echo -e "${C}  Дата (YYYY-MM-DD HH:MM): ${N}")" >&2
+       ts=$(date -d "$CUSTOM" +%s 2>/dev/null || true)
+       ;;
+    *) echo ""; return 0 ;;
+  esac
+  [[ -z "$ts" ]] && { warn "Не удалось распознать дату — клиент будет бессрочный" >&2; echo ""; return 0; }
+  echo "$ts"
 }
 
 _global_cleanup() {

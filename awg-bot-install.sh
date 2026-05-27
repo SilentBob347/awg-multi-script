@@ -414,7 +414,10 @@ LOCK_FILE    = "/run/awg-bot.lock"   # межпроцессный лок для 
 WARP_IFACE   = "warp0"
 WARP_PEERS   = "/etc/wgcf/peers.list"
 
-ADD_NAME, ADD_PROFILE = range(2)
+# Expire-механика (срок действия клиентов)
+EXPIRE_SUSPEND_IP = "127.0.0.2/32"
+
+ADD_NAME, ADD_PROFILE, ADD_EXPIRE, ADD_EXPIRE_CUSTOM, EXPIRE_CUSTOM_EXISTING = range(5)
 
 # Asyncio-примитивы создаются в main() — после старта event loop
 _add_client_lock: Optional[asyncio.Lock] = None
@@ -485,12 +488,18 @@ def load_config() -> dict:
 
 
 def run(cmd: list, input_str: Optional[str] = None) -> tuple:
-    r = subprocess.run(cmd, capture_output=True, text=True, input=input_str, timeout=30)
+    # LC_ALL=C форсит английский вывод (иначе на русской локали "latest handshake"
+    # парсится неверно и все клиенты показываются оффлайн).
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    r = subprocess.run(cmd, capture_output=True, text=True, input=input_str,
+                       timeout=30, env=env)
     return r.returncode, r.stdout, r.stderr
 
 
 def get_clients() -> list:
-    """Список клиентов с кэшированием на 30 секунд."""
+    """Список клиентов с кэшированием на 30 секунд.
+    Парсит # name, # expires=<ts>, # orig_ips=<ip>.
+    """
     cached = _clients_cache.get(CLIENTS_TTL)
     if cached is not None:
         return cached
@@ -502,8 +511,12 @@ def get_clients() -> list:
 
     name_map = {}
     for fpath in _glob.glob(CLIENTS_GLOB):
-        fname = Path(fpath).stem.replace("_awg2", "")
-        content = Path(fpath).read_text()
+        try:
+            fname = Path(fpath).stem.replace("_awg2", "")
+            content = Path(fpath).read_text()
+        except (OSError, UnicodeDecodeError) as e:
+            log.warning(f"Не могу прочитать {fpath}: {e}")
+            continue
         for line in content.splitlines():
             if line.startswith("PrivateKey"):
                 priv = line.split("=", 1)[1].strip()
@@ -512,18 +525,32 @@ def get_clients() -> list:
                     name_map[pub.strip()] = (fname, fpath)
                 break
 
-    content = Path(SERVER_CONF).read_text()
+    try:
+        content = Path(SERVER_CONF).read_text()
+    except OSError as e:
+        log.error(f"Не могу прочитать {SERVER_CONF}: {e}")
+        return clients
+
     for peer in re.split(r"\[Peer\]", content)[1:]:
-        pk_m = re.search(r"PublicKey\s*=\s*(.+)", peer)
-        ip_m = re.search(r"AllowedIPs\s*=\s*(.+)", peer)
-        cm_m = re.search(r"#\s*(.+)", peer)
+        pk_m   = re.search(r"^PublicKey\s*=\s*(.+)$",   peer, re.M)
+        ip_m   = re.search(r"^AllowedIPs\s*=\s*(.+)$",  peer, re.M)
+        # Имя — первый комментарий без "="
+        name_m = re.search(r"^#\s+([^=\n]+?)\s*$",      peer, re.M)
+        # Срок и оригинальный IP (служебные комментарии)
+        exp_m  = re.search(r"^#\s*expires=(\d+)\s*$",   peer, re.M)
+        orig_m = re.search(r"^#\s*orig_ips=(.+?)\s*$",  peer, re.M)
         if not pk_m:
             continue
-        pk   = pk_m.group(1).strip()
-        ip   = ip_m.group(1).strip() if ip_m else "?"
-        comment = cm_m.group(1).strip() if cm_m else ""
+        pk      = pk_m.group(1).strip()
+        ip      = ip_m.group(1).strip() if ip_m else "?"
+        comment = name_m.group(1).strip() if name_m else ""
         name, fpath = name_map.get(pk, (comment or pk[:8], ""))
-        clients.append({"name": name, "ip": ip, "pubkey": pk, "file": fpath})
+        client = {
+            "name": name, "ip": ip, "pubkey": pk, "file": fpath,
+            "expires": int(exp_m.group(1)) if exp_m else 0,
+            "orig_ip": orig_m.group(1).strip() if orig_m else "",
+        }
+        clients.append(client)
 
     _clients_cache.set(clients)
     return clients
@@ -680,6 +707,165 @@ def warp_toggle(client_ip: str, enable: bool) -> tuple:
         return False, f"{type(e).__name__}: {e}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Expire-механика: установить/снять срок, разблокировать
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _expire_apply_syncconf() -> bool:
+    """Применить изменения серверного конфига через awg syncconf (без рестарта)."""
+    rc, strip_out, _ = run(["awg-quick", "strip", AWG_IFACE])
+    if rc != 0:
+        return False
+    rc2, _, _ = run(["awg", "syncconf", AWG_IFACE, "/dev/stdin"], input_str=strip_out)
+    return rc2 == 0
+
+
+def expire_set(name: str, expires_ts: int) -> tuple:
+    """Поставить срок клиенту. Возвращает (ok, msg).
+    Минимум — 1 час от текущего момента."""
+    now = int(time.time())
+    if expires_ts <= now + 3540:
+        return False, "Минимум 1 час от текущего момента"
+    if not Path(SERVER_CONF).exists():
+        return False, "Серверный конфиг не найден"
+
+    try:
+        text = Path(SERVER_CONF).read_text()
+    except OSError as e:
+        return False, f"read: {e}"
+
+    parts  = re.split(r"(?=\[Peer\])", text)
+    header = parts[0]
+    peers  = parts[1:]
+
+    found = False
+    out_peers = []
+    for block in peers:
+        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+        if nm and nm.group(1).strip() == name:
+            found = True
+            # Заменить или добавить # expires=
+            if re.search(r"^#\s*expires=\d+\s*$", block, re.M):
+                block = re.sub(r"^#\s*expires=\d+\s*$",
+                               f"# expires={expires_ts}", block, count=1, flags=re.M)
+            else:
+                block = re.sub(
+                    r"(^#\s+" + re.escape(name) + r"\s*$)",
+                    lambda m: m.group(1) + f"\n# expires={expires_ts}",
+                    block, count=1, flags=re.M
+                )
+        out_peers.append(block)
+
+    if not found:
+        return False, f"клиент {name} не найден"
+
+    new_text = header + "".join(out_peers)
+    try:
+        d = os.path.dirname(SERVER_CONF)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_text)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, SERVER_CONF)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+    except Exception as e:
+        return False, f"write: {e}"
+
+    _expire_apply_syncconf()  # не критично если не получилось — таймер подхватит
+
+    # Сбросить warn1h флаг
+    state_dir = Path("/var/lib/awg2-expire")
+    if state_dir.exists():
+        # pubkey по name
+        c = next((x for x in get_clients() if x["name"] == name), None)
+        if c:
+            safe = re.sub(r"[^A-Za-z0-9]", "_", c["pubkey"])
+            (state_dir / f"warn1h_{safe}").unlink(missing_ok=True)
+
+    return True, "ok"
+
+
+def expire_clear(name: str) -> tuple:
+    """Снять срок. Если клиент был suspended — вернуть оригинальный IP."""
+    if not Path(SERVER_CONF).exists():
+        return False, "Серверный конфиг не найден"
+    try:
+        text = Path(SERVER_CONF).read_text()
+    except OSError as e:
+        return False, f"read: {e}"
+
+    parts  = re.split(r"(?=\[Peer\])", text)
+    header = parts[0]
+    peers  = parts[1:]
+
+    found = False
+    out_peers = []
+    for block in peers:
+        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+        if nm and nm.group(1).strip() == name:
+            found = True
+            orig_m = re.search(r"^#\s*orig_ips=(.+?)\s*$", block, re.M)
+            aip_m  = re.search(r"^AllowedIPs\s*=\s*(.+?)\s*$", block, re.M)
+            if orig_m and aip_m and aip_m.group(1).strip() == EXPIRE_SUSPEND_IP:
+                block = re.sub(r"^(AllowedIPs\s*=\s*).+$",
+                               r"\g<1>" + orig_m.group(1).strip(),
+                               block, count=1, flags=re.M)
+            block = re.sub(r"^#\s*expires=\d+\s*\n",   "", block, flags=re.M)
+            block = re.sub(r"^#\s*orig_ips=.+?\s*\n",  "", block, flags=re.M)
+        out_peers.append(block)
+
+    if not found:
+        return False, f"клиент {name} не найден"
+
+    new_text = header + "".join(out_peers)
+    try:
+        d = os.path.dirname(SERVER_CONF)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_text)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, SERVER_CONF)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+    except Exception as e:
+        return False, f"write: {e}"
+
+    _expire_apply_syncconf()
+    return True, "ok"
+
+
+def expire_fmt(ts: int) -> str:
+    """Форматирование unix-ts в "DD.MM HH:MM (через 2д 5ч)"."""
+    if not ts:
+        return ""
+    now  = int(time.time())
+    diff = ts - now
+    abs_d = abs(diff)
+    d  = abs_d // 86400
+    h  = (abs_d % 86400) // 3600
+    m  = (abs_d % 3600) // 60
+    parts = []
+    if d > 0: parts.append(f"{d}д")
+    if h > 0: parts.append(f"{h}ч")
+    if not parts or (d == 0 and h == 0):
+        parts.append(f"{m}м")
+    human = " ".join(parts)
+    try:
+        when = time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+    except Exception:
+        when = f"ts={ts}"
+    if diff < 0:
+        return f"{when} (истёк {human} назад)"
+    return f"{when} (через {human})"
+
+
 def online_icon(last_hs: int) -> str:
     if not last_hs:
         return "⚫"
@@ -754,18 +940,27 @@ class Keyboards:
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
-    def client_card(name: str, warp_on: bool = False) -> InlineKeyboardMarkup:
+    def client_card(name: str, warp_on: bool = False,
+                    has_expire: bool = False, is_suspended: bool = False) -> InlineKeyboardMarkup:
         warp_btn = (
             InlineKeyboardButton("☁️ Выкл WARP", callback_data=f"warpoff:{name}")
             if warp_on else
             InlineKeyboardButton("🌍 Вкл WARP",  callback_data=f"warpon:{name}")
         )
+        # Кнопка срока меняется в зависимости от состояния
+        if is_suspended:
+            expire_btn = InlineKeyboardButton("🔓 Разблокировать", callback_data=f"expunban:{name}")
+        elif has_expire:
+            expire_btn = InlineKeyboardButton("⏰ Срок (изменить/снять)", callback_data=f"expire:{name}")
+        else:
+            expire_btn = InlineKeyboardButton("⏰ Установить срок", callback_data=f"expire:{name}")
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 QR-код",      callback_data=f"qr:{name}"),
              InlineKeyboardButton("📄 Текст",        callback_data=f"conf:{name}")],
             [InlineKeyboardButton("📁 Файл .conf",  callback_data=f"file:{name}"),
              InlineKeyboardButton("🗑 Удалить",      callback_data=f"del:{name}")],
             [warp_btn],
+            [expire_btn],
             [InlineKeyboardButton("◀️ К списку",    callback_data="clients")],
         ])
 
@@ -784,6 +979,41 @@ class Keyboards:
             [InlineKeyboardButton("🌐 DNS Query",             callback_data="prof:dns")],
             [InlineKeyboardButton("🔇 Базовый (без I1-I5)",  callback_data="prof:basic")],
             [InlineKeyboardButton("❌ Отмена",               callback_data="cancel_add")],
+        ])
+
+    @staticmethod
+    def expire_presets(name: str, has_expire: bool = False) -> InlineKeyboardMarkup:
+        """Клавиатура выбора срока действия (используется и в карточке, и при создании).
+        В режиме создания клиента (передаём префикс 'expnew') — name это маркер ctx.
+        В режиме редактирования (префикс 'expset') — реальное имя клиента.
+        """
+        prefix = "expset"  # выбор для существующего клиента
+        rows = [
+            [InlineKeyboardButton("1 час",   callback_data=f"{prefix}:{name}:1h"),
+             InlineKeyboardButton("6 ч",     callback_data=f"{prefix}:{name}:6h"),
+             InlineKeyboardButton("1 день",  callback_data=f"{prefix}:{name}:1d")],
+            [InlineKeyboardButton("3 дня",   callback_data=f"{prefix}:{name}:3d"),
+             InlineKeyboardButton("7 дней",  callback_data=f"{prefix}:{name}:7d"),
+             InlineKeyboardButton("30 дней", callback_data=f"{prefix}:{name}:30d")],
+            [InlineKeyboardButton("📅 Своя дата", callback_data=f"expcustom:{name}")],
+        ]
+        if has_expire:
+            rows.append([InlineKeyboardButton("🚫 Снять срок (бессрочно)",
+                                              callback_data=f"expclear:{name}")])
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"c:{name}")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def expire_presets_at_creation() -> InlineKeyboardMarkup:
+        """При создании клиента (после выбора профиля) — спрашиваем срок.
+        callback prefix 'expnew' — без имени, обрабатывается через ctx.user_data."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("♾ Бессрочно", callback_data="expnew:none")],
+            [InlineKeyboardButton("1 час",  callback_data="expnew:1h"),
+             InlineKeyboardButton("1 день", callback_data="expnew:1d"),
+             InlineKeyboardButton("7 дней", callback_data="expnew:7d")],
+            [InlineKeyboardButton("30 дней", callback_data="expnew:30d")],
+            [InlineKeyboardButton("📅 Своя дата", callback_data="expnew:custom")],
         ])
 
     @staticmethod
@@ -873,12 +1103,23 @@ def text_client_card(c: dict) -> str:
             warp_line = "\n☁️ Маршрут: <b>через WARP</b>"
         else:
             warp_line = "\n🌍 Маршрут: напрямую"
+    # Срок действия
+    expire_line = ""
+    exp_ts  = c.get("expires", 0)
+    orig_ip = c.get("orig_ip", "")
+    if exp_ts:
+        if orig_ip:
+            # Заблокирован
+            expire_line = f"\n🚫 <b>Заблокирован</b> (срок истёк)\n   {expire_fmt(exp_ts)}"
+        else:
+            expire_line = f"\n⏰ Истекает: {expire_fmt(exp_ts)}"
     return (
         f"👤 <b>{c['name']}</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"🌐 IP: <code>{c['ip']}</code>\n"
         f"{online_icon(hs)} {elapsed_str(hs)}\n"
         f"↓ {s.get('rx', '—')}  ↑ {s.get('tx', '—')}"
         f"{warp_line}"
+        f"{expire_line}"
     )
 
 
@@ -1009,18 +1250,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Внимание: "prof:" обрабатывается ТОЛЬКО в ConversationHandler.
         # Если включить его сюда — будет двойная обработка (баг с "уже существует").
         dispatch = {
-            "c":       _cb_client_card,
-            "qr":      _cb_client_qr,
-            "conf":    _cb_client_conf,
-            "file":    _cb_client_file,
-            "del":     _cb_client_del_confirm,
-            "delok":   _cb_client_del,
-            "warpon":  _cb_warp_on,
-            "warpoff": _cb_warp_off,
+            "c":        _cb_client_card,
+            "qr":       _cb_client_qr,
+            "conf":     _cb_client_conf,
+            "file":     _cb_client_file,
+            "del":      _cb_client_del_confirm,
+            "delok":    _cb_client_del,
+            "warpon":   _cb_warp_on,
+            "warpoff":  _cb_warp_off,
+            "expire":   _cb_expire_menu,
+            "expset":   _cb_expire_set,       # payload = "NAME:DURATION"
+            "expclear": _cb_expire_clear,
+            "expunban": _cb_expire_unban,
+            "expcustom": _cb_expire_custom_start,
         }
         handler = dispatch.get(prefix)
         if handler:
             await handler(q, payload, ctx)
+        # expnew:* — обрабатывается через ConversationHandler (ADD_EXPIRE / ADD_EXPIRE_CUSTOM)
+        elif prefix == "expnew":
+            pass
         elif prefix not in ("prof",):  # prof обрабатывается ConversationHandler-ом
             log.warning(f"Неизвестный callback prefix: {prefix!r}")
 
@@ -1028,15 +1277,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── вспомогательные колбэк-функции ────────────────────────────────────────────
 
 def _client_card_kb(name: str) -> InlineKeyboardMarkup:
-    """Клавиатура карточки клиента с актуальным WARP-статусом."""
-    if not warp_available():
-        return kb.client_card(name, warp_on=False)
-    # Найдём IP клиента
+    """Клавиатура карточки клиента с актуальным WARP-статусом и состоянием срока."""
     clients = get_clients()
     c = next((x for x in clients if x["name"] == name), None)
     if not c:
-        return kb.client_card(name, warp_on=False)
-    return kb.client_card(name, warp_on=warp_is_enabled_for(c["ip"]))
+        return kb.client_card(name, warp_on=False, has_expire=False, is_suspended=False)
+    warp_on = warp_available() and warp_is_enabled_for(c["ip"])
+    has_expire   = bool(c.get("expires", 0))
+    is_suspended = has_expire and bool(c.get("orig_ip", ""))
+    return kb.client_card(name, warp_on=warp_on,
+                          has_expire=has_expire, is_suspended=is_suspended)
 
 
 async def _cb_clients(q):
@@ -1100,7 +1350,10 @@ async def _cb_restart(q):
         )
 
 
-async def _cb_client_card(q, name: str, _ctx):
+async def _cb_client_card(q, name: str, ctx):
+    # Сбросить флаг ожидания ввода даты, если пользователь вернулся в карточку
+    if ctx and hasattr(ctx, "user_data"):
+        ctx.user_data.pop("awaiting_custom_expire", None)
     clients = get_clients()
     c = next((x for x in clients if x["name"] == name), None)
     if not c:
@@ -1337,6 +1590,257 @@ async def _cb_warp_toggle(q, name: str, ctx, enable: bool):
         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Expire-колбэки
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DURATION_MAP = {
+    "1h":  3600,
+    "6h":  6 * 3600,
+    "1d":  86400,
+    "3d":  3 * 86400,
+    "7d":  7 * 86400,
+    "30d": 30 * 86400,
+}
+
+
+def parse_custom_expire(text: str) -> Optional[int]:
+    """Парсит пользовательский ввод и возвращает unix-ts (>= now+1h, <= now+2y).
+    Принимаемые форматы:
+      Относительные: "+2h", "2h", "+90m", "+3d", "+2w"
+      Дата+время:    "2026-05-28 18:30", "28.05.2026 18:30", "28.05 18:30" (текущий год)
+    Возвращает None если не распознано или вне диапазона.
+    """
+    s = (text or "").strip().lower().replace("в ", " ")
+    if not s:
+        return None
+    now = int(time.time())
+    min_ts = now + 3540          # +1 час минус буфер 1 мин
+    max_ts = now + 2 * 365 * 86400  # +2 года максимум
+
+    # Относительное: +Nh / +Nd / +Nw / +Nm (минуты)
+    m = re.match(r"^\+?\s*(\d+)\s*([mhdw])$", s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        mult = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[unit]
+        ts = now + n * mult
+        return ts if min_ts <= ts <= max_ts else None
+
+    # Дата+время в нескольких форматах
+    fmts = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m %H:%M",
+        "%d/%m/%Y %H:%M",
+    ]
+    cur_year = time.localtime(now).tm_year
+    for fmt in fmts:
+        try:
+            t = time.strptime(s, fmt)
+            # Если в формате нет года — подставляем текущий
+            if "%Y" not in fmt:
+                t = time.struct_time((cur_year, t.tm_mon, t.tm_mday,
+                                      t.tm_hour, t.tm_min, t.tm_sec,
+                                      0, 0, -1))
+            ts = int(time.mktime(t))
+            if min_ts <= ts <= max_ts:
+                return ts
+        except (ValueError, OverflowError):
+            continue
+    return None
+
+
+async def _cb_expire_menu(q, name: str, _ctx):
+    """Открыть меню срока для существующего клиента."""
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if not c:
+        await q.edit_message_text("❌ Клиент не найден")
+        return
+    has_expire = bool(c.get("expires", 0))
+    if has_expire:
+        text = (
+            f"⏰ <b>Срок действия: {name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Текущий: {expire_fmt(c['expires'])}\n\n"
+            f"Выбери новый или сними срок:"
+        )
+    else:
+        text = (
+            f"⏰ <b>Установить срок: {name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Сейчас клиент бессрочный.\n"
+            f"Выбери срок действия:"
+        )
+    await q.edit_message_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=kb.expire_presets(name, has_expire=has_expire)
+    )
+
+
+async def _cb_expire_set(q, payload: str, ctx):
+    """payload = 'NAME:DURATION' (например 'alice:7d')."""
+    if ":" not in payload:
+        await q.edit_message_text("❌ Неверный payload")
+        return
+    name, duration = payload.split(":", 1)
+    duration = duration.strip()
+    sec = _DURATION_MAP.get(duration)
+    if not sec:
+        await q.edit_message_text(f"❌ Неизвестный пресет: {duration}")
+        return
+    ts = int(time.time()) + sec
+    admin_id = ctx.bot_data.get("admin_id", "")
+
+    await q.edit_message_text(
+        f"⏳ Ставлю срок {duration} для <b>{name}</b>...",
+        parse_mode=ParseMode.HTML
+    )
+    ok_flag, msg = await asyncio.to_thread(expire_set, name, ts)
+    _clients_cache.invalidate()
+
+    if not ok_flag:
+        await q.edit_message_text(
+            f"❌ Ошибка: {_html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+        return
+
+    log.info(f"expire set: {name} → {expire_fmt(ts)} admin={admin_id}")
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if c:
+        await q.edit_message_text(
+            text_client_card(c), parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+    else:
+        await q.edit_message_text(f"✅ Срок установлен: {expire_fmt(ts)}")
+
+
+async def _cb_expire_clear(q, name: str, ctx):
+    """Снять срок с клиента."""
+    admin_id = ctx.bot_data.get("admin_id", "")
+    await q.edit_message_text(
+        f"⏳ Снимаю срок с <b>{name}</b>...",
+        parse_mode=ParseMode.HTML
+    )
+    ok_flag, msg = await asyncio.to_thread(expire_clear, name)
+    _clients_cache.invalidate()
+
+    if not ok_flag:
+        await q.edit_message_text(
+            f"❌ Ошибка: {_html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+        return
+
+    log.info(f"expire clear: {name} admin={admin_id}")
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if c:
+        await q.edit_message_text(
+            text_client_card(c), parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+    else:
+        await q.edit_message_text(f"✅ Срок снят — клиент бессрочный")
+
+
+async def _cb_expire_unban(q, name: str, ctx):
+    """Разблокировать просроченного клиента (вернуть IP)."""
+    admin_id = ctx.bot_data.get("admin_id", "")
+    await q.edit_message_text(
+        f"⏳ Разблокирую <b>{name}</b>...",
+        parse_mode=ParseMode.HTML
+    )
+    # Разблокировка = clear (вернёт orig_ips, удалит expires)
+    ok_flag, msg = await asyncio.to_thread(expire_clear, name)
+    _clients_cache.invalidate()
+
+    if not ok_flag:
+        await q.edit_message_text(
+            f"❌ Ошибка: {_html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+        return
+
+    log.info(f"expire unban: {name} admin={admin_id}")
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if c:
+        await q.edit_message_text(
+            f"🔓 <b>{name}</b> разблокирован\nIP: <code>{c['ip']}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+    else:
+        await q.edit_message_text("🔓 Разблокирован")
+
+
+async def _cb_expire_custom_start(q, name: str, ctx):
+    """Запрос ввода своей даты для существующего клиента.
+    Дальше сообщение поймает handle_any_message через флаг user_data."""
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if not c:
+        await q.edit_message_text("❌ Клиент не найден")
+        return
+    # Ставим флаг — следующее текстовое сообщение интерпретируем как дату
+    ctx.user_data["awaiting_custom_expire"] = name
+    cancel_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data=f"c:{name}")
+    ]])
+    await q.edit_message_text(
+        f"📅 <b>Своя дата для {name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Введи срок в одном из форматов:\n\n"
+        f"<b>Относительный:</b>\n"
+        f"  <code>+2h</code> — через 2 часа\n"
+        f"  <code>+90m</code> — через 90 минут\n"
+        f"  <code>+3d</code> — через 3 дня\n"
+        f"  <code>+2w</code> — через 2 недели\n\n"
+        f"<b>Точная дата (МСК):</b>\n"
+        f"  <code>28.05.2026 18:30</code>\n"
+        f"  <code>2026-05-28 18:30</code>\n"
+        f"  <code>28.05 18:30</code> (текущий год)\n\n"
+        f"<i>Минимум — 1 час от сейчас, максимум — 2 года.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb
+    )
+
+
+async def _apply_custom_expire_to_existing(update: Update, name: str, ts: int):
+    """Применить дату ts к существующему клиенту name."""
+    ok_flag, msg = await asyncio.to_thread(expire_set, name, ts)
+    _clients_cache.invalidate()
+    if not ok_flag:
+        await update.message.reply_text(
+            f"❌ Ошибка: {_html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+        return
+    log.info(f"expire custom set: {name} → {expire_fmt(ts)}")
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if c:
+        await update.message.reply_text(
+            text_client_card(c), parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Срок установлен: {expire_fmt(ts)}", parse_mode=ParseMode.HTML
+        )
+
+
 async def _cb_add_profile(q, profile: str, ctx):
     """Вызывается из ConversationHandler — шаг выбора профиля."""
     name = ctx.user_data.get("new_name", "")
@@ -1382,19 +1886,21 @@ async def _cb_add_profile(q, profile: str, ctx):
         _clients_cache.invalidate()
 
     if ok_flag:
+        # Запоминаем имя для следующего шага и показываем выбор срока
+        ctx.user_data["new_name"] = name
         await q.edit_message_text(
-            f"✅ <b>{name}</b> создан!\n{msg}",
+            f"✅ <b>{name}</b> создан!\n{msg}\n\n"
+            f"⏰ <b>Срок действия?</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("👥 К клиентам", callback_data="clients")
-            ]])
+            reply_markup=kb.expire_presets_at_creation()
         )
+        return ADD_EXPIRE
     else:
         await q.edit_message_text(
             f"❌ Ошибка:\n<code>{_html.escape(msg)}</code>",
             parse_mode=ParseMode.HTML,
         )
-    return ConversationHandler.END
+        return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1480,19 +1986,21 @@ async def on_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _clients_cache.invalidate()
 
         if ok_flag:
+            # Запоминаем имя для шага выбора срока
+            ctx.user_data["new_name"] = name
             await msg_obj.edit_text(
-                f"✅ <b>{name}</b> создан!\n{result_msg}",
+                f"✅ <b>{name}</b> создан!\n{result_msg}\n\n"
+                f"⏰ <b>Срок действия?</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("👥 К клиентам", callback_data="clients")
-                ]])
+                reply_markup=kb.expire_presets_at_creation()
             )
+            return ADD_EXPIRE
         else:
             await msg_obj.edit_text(
                 f"❌ Ошибка:\n<code>{_html.escape(result_msg)}</code>",
                 parse_mode=ParseMode.HTML,
             )
-        return ConversationHandler.END
+            return ConversationHandler.END
 
     # Pro / неизвестный профиль — показываем меню как раньше
     await update.message.reply_text(
@@ -1511,6 +2019,139 @@ async def on_add_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @auth
+async def on_add_expire_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбор срока при создании клиента. payload: expnew:none|1h|...|custom"""
+    q = update.callback_query
+    await q.answer()
+    name = ctx.user_data.get("new_name", "")
+    if not name:
+        ctx.user_data.clear()
+        await q.edit_message_text("❌ Имя не задано")
+        return ConversationHandler.END
+
+    payload = q.data.split(":", 1)[1] if ":" in q.data else "none"
+
+    final_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👥 К клиентам", callback_data="clients")
+    ]])
+
+    if payload == "custom":
+        # Запрашиваем ввод даты — переходим в новый state
+        cancel_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("♾ Бессрочно", callback_data="expnew:none")
+        ]])
+        await q.edit_message_text(
+            f"📅 <b>Своя дата для {name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Введи срок в одном из форматов:\n\n"
+            f"<b>Относительный:</b>\n"
+            f"  <code>+2h</code> — через 2 часа\n"
+            f"  <code>+90m</code> — через 90 минут\n"
+            f"  <code>+3d</code> — через 3 дня\n"
+            f"  <code>+2w</code> — через 2 недели\n\n"
+            f"<b>Точная дата (МСК):</b>\n"
+            f"  <code>28.05.2026 18:30</code>\n"
+            f"  <code>2026-05-28 18:30</code>\n"
+            f"  <code>28.05 18:30</code> (текущий год)\n\n"
+            f"<i>Минимум — 1 час, максимум — 2 года.</i>\n"
+            f"Или жми «Бессрочно» чтобы пропустить:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_kb
+        )
+        return ADD_EXPIRE_CUSTOM
+
+    # Остальные пресеты — как раньше
+    ctx.user_data.clear()
+
+    if payload == "none":
+        await q.edit_message_text(
+            f"✅ <b>{name}</b> создан\n♾ Срок: бессрочно",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+        return ConversationHandler.END
+
+    sec = _DURATION_MAP.get(payload)
+    if not sec:
+        await q.edit_message_text(
+            f"⚠️ <b>{name}</b> создан, но срок не распознан ({payload})\nКлиент бессрочный.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+        return ConversationHandler.END
+
+    ts = int(time.time()) + sec
+    ok_flag, msg = await asyncio.to_thread(expire_set, name, ts)
+    _clients_cache.invalidate()
+
+    if ok_flag:
+        log.info(f"new client {name} → expire {expire_fmt(ts)}")
+        await q.edit_message_text(
+            f"✅ <b>{name}</b> создан\n⏰ Срок: {expire_fmt(ts)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+    else:
+        await q.edit_message_text(
+            f"⚠️ <b>{name}</b> создан, но срок не установлен:\n<code>{_html.escape(msg)}</code>\n"
+            f"Клиент будет бессрочным.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+    return ConversationHandler.END
+
+
+@auth
+async def on_add_expire_custom_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Пользователь ввёл текст с датой во время создания клиента (ADD_EXPIRE_CUSTOM)."""
+    name = ctx.user_data.get("new_name", "")
+    if not name:
+        ctx.user_data.clear()
+        await update.message.reply_text("❌ Сессия потеряна")
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    ts = parse_custom_expire(text)
+
+    final_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👥 К клиентам", callback_data="clients")
+    ]])
+
+    if ts is None:
+        retry_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("♾ Бессрочно (пропустить)", callback_data="expnew:none")
+        ]])
+        await update.message.reply_text(
+            f"❌ Не распознано: <code>{_html.escape(text)}</code>\n"
+            f"Попробуй ещё раз (или нажми Бессрочно):\n\n"
+            f"Примеры: <code>+2h</code>, <code>+3d</code>, "
+            f"<code>28.05.2026 18:30</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=retry_kb
+        )
+        return ADD_EXPIRE_CUSTOM
+
+    ctx.user_data.clear()
+    ok_flag, msg = await asyncio.to_thread(expire_set, name, ts)
+    _clients_cache.invalidate()
+
+    if ok_flag:
+        log.info(f"new client {name} → expire custom {expire_fmt(ts)}")
+        await update.message.reply_text(
+            f"✅ <b>{name}</b> создан\n⏰ Срок: {expire_fmt(ts)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ <b>{name}</b> создан, но срок не установлен:\n<code>{_html.escape(msg)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=final_kb
+        )
+    return ConversationHandler.END
+
+
+@auth
 async def on_conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1523,8 +2164,26 @@ async def on_conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @auth
 async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок Reply Keyboard снизу."""
+    """Обработчик кнопок Reply Keyboard снизу + ввод своей даты для срока."""
     text = (update.message.text or "").strip()
+
+    # Перехват ввода даты для существующего клиента (см. _cb_expire_custom_start)
+    pending_name = ctx.user_data.get("awaiting_custom_expire")
+    if pending_name:
+        ts = parse_custom_expire(text)
+        if ts is None:
+            await update.message.reply_text(
+                f"❌ Не распознано: <code>{_html.escape(text)}</code>\n"
+                f"Примеры: <code>+2h</code>, <code>+3d</code>, "
+                f"<code>28.05.2026 18:30</code>\n"
+                f"Жми отмену в карточке клиента чтобы выйти.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        # Применяем
+        ctx.user_data.pop("awaiting_custom_expire", None)
+        await _apply_custom_expire_to_existing(update, pending_name, ts)
+        return
 
     if text == "👥 Клиенты":
         clients = get_clients()
@@ -2090,6 +2749,11 @@ def main():
         states={
             ADD_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_name)],
             ADD_PROFILE: [CallbackQueryHandler(on_add_profile, pattern="^prof:")],
+            ADD_EXPIRE:  [CallbackQueryHandler(on_add_expire_choice, pattern="^expnew:")],
+            ADD_EXPIRE_CUSTOM: [
+                CallbackQueryHandler(on_add_expire_choice, pattern="^expnew:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_expire_custom_text),
+            ],
         },
         fallbacks=[
             CallbackQueryHandler(on_conv_cancel, pattern="^cancel_add$"),
@@ -2107,7 +2771,7 @@ def main():
     app.add_handler(conv, group=-1)
     # Колбэки: исключаем prof:* и cancel_add — они обрабатываются ConversationHandler-ом
     app.add_handler(
-        CallbackQueryHandler(on_callback, pattern=r"^(?!prof:|cancel_add$).+"),
+        CallbackQueryHandler(on_callback, pattern=r"^(?!prof:|expnew:|cancel_add$).+"),
         group=0
     )
     app.add_handler(MessageHandler(
