@@ -379,6 +379,7 @@ AWG Toolza Bot — Telegram управление AmneziaWG сервером
 """
 
 import asyncio
+import base64
 import fcntl
 import html as _html
 import logging
@@ -539,16 +540,25 @@ def get_clients() -> list:
         # Срок и оригинальный IP (служебные комментарии)
         exp_m  = re.search(r"^#\s*expires=(\d+)\s*$",   peer, re.M)
         orig_m = re.search(r"^#\s*orig_ips=(.+?)\s*$",  peer, re.M)
+        # Заметка админа (произвольный текст, base64 чтобы не ломать конфиг)
+        note_m = re.search(r"^#\s*note=(.*?)\s*$",      peer, re.M)
         if not pk_m:
             continue
         pk      = pk_m.group(1).strip()
         ip      = ip_m.group(1).strip() if ip_m else "?"
         comment = name_m.group(1).strip() if name_m else ""
+        note    = ""
+        if note_m:
+            try:
+                note = base64.b64decode(note_m.group(1).strip()).decode("utf-8", "replace")
+            except Exception:
+                note = ""
         name, fpath = name_map.get(pk, (comment or pk[:8], ""))
         client = {
             "name": name, "ip": ip, "pubkey": pk, "file": fpath,
             "expires": int(exp_m.group(1)) if exp_m else 0,
             "orig_ip": orig_m.group(1).strip() if orig_m else "",
+            "note": note,
         }
         clients.append(client)
 
@@ -841,6 +851,132 @@ def expire_clear(name: str) -> tuple:
     return True, "ok"
 
 
+def _normalize_note(text: str) -> str:
+    """Если заметка похожа на адрес без схемы — подставляем http://.
+    Иначе возвращаем как есть. Делает голые IP/домены кликабельными."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    # Уже есть схема — не трогаем
+    if re.match(r"^[a-z][a-z0-9+.-]*://", t, re.I):
+        return t
+    # Чистый адрес одним "словом" (без пробелов): IP[:port][/path] или домен[:port][/path]
+    if " " not in t and re.match(
+        r"^("
+        r"\d{1,3}(\.\d{1,3}){3}"                 # IPv4
+        r"|[a-z0-9-]+(\.[a-z0-9-]+)+"            # домен с точкой (example.net)
+        r")"
+        r"(:\d{1,5})?(/\S*)?$",
+        t, re.I
+    ):
+        return "http://" + t
+    return t
+
+
+def note_set(name: str, note_text: str) -> tuple:
+    """Записать заметку клиенту (произвольный текст, до 200 симв).
+    Хранится в peer-блоке как # note=<base64> чтобы не ломать конфиг.
+    Адреса без схемы (192.168.1.1, my.keenetic.net) дополняются http://."""
+    note_text = _normalize_note(note_text)
+    if len(note_text) > 200:
+        return False, "Заметка слишком длинная (макс 200 символов)"
+    if not Path(SERVER_CONF).exists():
+        return False, "Серверный конфиг не найден"
+    try:
+        text = Path(SERVER_CONF).read_text()
+    except OSError as e:
+        return False, f"read: {e}"
+
+    encoded = base64.b64encode(note_text.encode("utf-8")).decode("ascii")
+
+    parts  = re.split(r"(?=\[Peer\])", text)
+    header = parts[0]
+    peers  = parts[1:]
+
+    found = False
+    out_peers = []
+    for block in peers:
+        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+        if nm and nm.group(1).strip() == name:
+            found = True
+            if re.search(r"^#\s*note=.*$", block, re.M):
+                block = re.sub(r"^#\s*note=.*$", f"# note={encoded}",
+                               block, count=1, flags=re.M)
+            else:
+                # Вставляем после комментария-имени
+                block = re.sub(
+                    r"(^#\s+" + re.escape(name) + r"\s*$)",
+                    lambda m: m.group(1) + f"\n# note={encoded}",
+                    block, count=1, flags=re.M
+                )
+        out_peers.append(block)
+
+    if not found:
+        return False, f"клиент {name} не найден"
+
+    new_text = header + "".join(out_peers)
+    try:
+        d = os.path.dirname(SERVER_CONF)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_text)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, SERVER_CONF)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+    except Exception as e:
+        return False, f"write: {e}"
+    # Заметка — это только комментарий, syncconf не нужен (awg его игнорирует),
+    # но конфиг изменён, поэтому инвалидируем кэш на стороне вызова.
+    return True, "ok"
+
+
+def note_clear(name: str) -> tuple:
+    """Удалить заметку у клиента."""
+    if not Path(SERVER_CONF).exists():
+        return False, "Серверный конфиг не найден"
+    try:
+        text = Path(SERVER_CONF).read_text()
+    except OSError as e:
+        return False, f"read: {e}"
+
+    parts  = re.split(r"(?=\[Peer\])", text)
+    header = parts[0]
+    peers  = parts[1:]
+
+    found = False
+    out_peers = []
+    for block in peers:
+        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+        if nm and nm.group(1).strip() == name:
+            found = True
+            block = re.sub(r"^#\s*note=.*\n", "", block, flags=re.M)
+        out_peers.append(block)
+
+    if not found:
+        return False, f"клиент {name} не найден"
+
+    new_text = header + "".join(out_peers)
+    try:
+        d = os.path.dirname(SERVER_CONF)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_text)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, SERVER_CONF)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+    except Exception as e:
+        return False, f"write: {e}"
+    return True, "ok"
+
+
 def expire_fmt(ts: int) -> str:
     """Форматирование unix-ts в "DD.MM HH:MM (через 2д 5ч)"."""
     if not ts:
@@ -941,7 +1077,8 @@ class Keyboards:
 
     @staticmethod
     def client_card(name: str, warp_on: bool = False,
-                    has_expire: bool = False, is_suspended: bool = False) -> InlineKeyboardMarkup:
+                    has_expire: bool = False, is_suspended: bool = False,
+                    has_note: bool = False) -> InlineKeyboardMarkup:
         warp_btn = (
             InlineKeyboardButton("☁️ Выкл WARP", callback_data=f"warpoff:{name}")
             if warp_on else
@@ -954,6 +1091,9 @@ class Keyboards:
             expire_btn = InlineKeyboardButton("⏰ Срок (изменить/снять)", callback_data=f"expire:{name}")
         else:
             expire_btn = InlineKeyboardButton("⏰ Установить срок", callback_data=f"expire:{name}")
+        note_btn = InlineKeyboardButton(
+            "📝 Заметка (изм/удалить)" if has_note else "📝 Добавить заметку",
+            callback_data=f"note:{name}")
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 QR-код",      callback_data=f"qr:{name}"),
              InlineKeyboardButton("📄 Текст",        callback_data=f"conf:{name}")],
@@ -961,6 +1101,7 @@ class Keyboards:
              InlineKeyboardButton("🗑 Удалить",      callback_data=f"del:{name}")],
             [warp_btn],
             [expire_btn],
+            [note_btn],
             [InlineKeyboardButton("◀️ К списку",    callback_data="clients")],
         ])
 
@@ -1050,46 +1191,195 @@ def text_main() -> str:
     )
 
 
+def _parse_xfer_to_bytes(s: str) -> int:
+    """'1.2 GiB' / '800 MiB' / '—' → байты (для сортировки топа)."""
+    if not s or s == "—":
+        return 0
+    parts = s.split()
+    if len(parts) < 2:
+        return 0
+    try:
+        num = float(parts[0])
+    except ValueError:
+        return 0
+    unit = parts[1].lower()
+    mult = {
+        "b": 1, "byte": 1, "bytes": 1,
+        "kib": 1024, "kb": 1000,
+        "mib": 1024**2, "mb": 1000**2,
+        "gib": 1024**3, "gb": 1000**3,
+        "tib": 1024**4, "tb": 1000**4,
+    }.get(unit, 1)
+    return int(num * mult)
+
+
+def _fmt_short(b: int) -> str:
+    """Компактный формат для топа: 1.2G / 800M / 450K."""
+    if b >= 1024**3:
+        return f"{b/1024**3:.1f}G"
+    if b >= 1024**2:
+        return f"{b/1024**2:.0f}M"
+    if b >= 1024:
+        return f"{b/1024:.0f}K"
+    return f"{b}B"
+
+
+def _status_system() -> dict:
+    """Диск/RAM/load/uptime интерфейса awg0. Всё опционально."""
+    d = {"disk": "—", "ram": "—", "load": "—", "awg_uptime": "—"}
+    # Диск корня
+    rc, out, _ = run(["bash", "-c",
+        "df -h / | awk 'NR==2{print $3\" / \"$2\" · \"$5}'"])
+    if rc == 0 and out.strip():
+        d["disk"] = out.strip()
+    # RAM
+    rc, out, _ = run(["bash", "-c",
+        "free -m | awk 'NR==2{printf \"%dM / %.0fG\", $3, $2/1024}'"])
+    if rc == 0 and out.strip():
+        d["ram"] = out.strip()
+    # Load average (1 мин)
+    rc, out, _ = run(["bash", "-c",
+        "cut -d' ' -f1 /proc/loadavg"])
+    if rc == 0 and out.strip():
+        d["load"] = out.strip()
+    # Аптайм интерфейса awg0 (по времени создания /sys)
+    rc, out, _ = run(["bash", "-c",
+        "awk '{u=$1} END{d=int(u/86400);h=int((u%86400)/3600);"
+        "printf (d>0?\"%dд %dч\":\"%dч\"), (d>0?d:h), h}' /proc/uptime"])
+    if rc == 0 and out.strip():
+        d["awg_uptime"] = out.strip()
+    return d
+
+
+def _status_version() -> str:
+    """Версия awg2 с сервера (/usr/local/bin/awg2)."""
+    for p in ("/usr/local/bin/awg2", "/usr/bin/awg2"):
+        try:
+            for line in Path(p).read_text().splitlines()[:10]:
+                if line.startswith("VERSION="):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            continue
+    return "—"
+
+
+def _status_dns() -> str:
+    """Краткий DNS-чек по образцу awg2: жив ли dnscrypt-proxy + есть ли DNAT.
+    Резолвер awg2 слушает на 127.0.2.1:53 (не 127.0.0.1)."""
+    # dnscrypt-proxy активен?
+    rc, _, _ = run(["systemctl", "is-active", "--quiet", "dnscrypt-proxy"])
+    if rc == 0:
+        resolver = "✓"
+    else:
+        # Возможно резолвер вообще не настроен — проверим что хоть кто-то на :53
+        rc2, out2, _ = run(["bash", "-c", "ss -ulnp 2>/dev/null | grep -c ':53 '"])
+        resolver = "✓" if (rc2 == 0 and out2.strip() not in ("", "0")) else "✗"
+    # DNAT-правило awg0 → резолвер
+    rc, out, _ = run(["bash", "-c",
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -c 'dport 53'"])
+    dnat = "✓" if (rc == 0 and out.strip() not in ("", "0")) else "—"
+    return f"резолвер {resolver} · DNAT {dnat}"
+
+
 def text_status() -> str:
     info    = get_server_info()
     clients = get_clients()
     stats   = get_live_stats()
+    now     = int(time.time())
+
     online  = sum(
         1 for c in clients
         if stats.get(c["pubkey"], {}).get("last_hs", 0)
-        and (time.time() - stats[c["pubkey"]]["last_hs"]) < 300
+        and (now - stats[c["pubkey"]]["last_hs"]) < 300
     )
+
+    # Суммарный трафик
     rc, out, _ = run(["awg", "show", AWG_IFACE, "transfer"])
     rx = tx = 0
     for line in out.splitlines():
         p = line.split()
         if len(p) >= 3:
             try:
-                rx += int(p[1])
-                tx += int(p[2])
+                rx += int(p[1]); tx += int(p[2])
             except ValueError:
                 pass
-    # Лейбл профиля (Lite / Standard / Pro / —)
+
+    # Сроки: всего со сроком / заблокировано / истекает за 24ч
+    n_exp = n_blocked = n_soon = 0
+    for c in clients:
+        e = c.get("expires", 0)
+        if not e:
+            continue
+        n_exp += 1
+        if c.get("orig_ip"):
+            n_blocked += 1
+        elif 0 < (e - now) <= 86400:
+            n_soon += 1
+
+    # Топ-3 по трафику (rx+tx) из live-статы
+    traf = []
+    for c in clients:
+        s = stats.get(c["pubkey"], {})
+        total = _parse_xfer_to_bytes(s.get("rx", "—")) + _parse_xfer_to_bytes(s.get("tx", "—"))
+        if total > 0:
+            traf.append((c["name"], total))
+    traf.sort(key=lambda x: x[1], reverse=True)
+    top = traf[:3]
+
+    # WARP
+    if warp_available():
+        warp_line = f"{len(warp_get_peers())} кл · warp0 ✓"
+    else:
+        warp_line = "не настроен"
+
+    sysd = _status_system()
+    ver  = _status_version()
+    dns  = _status_dns()
+
+    # Индикатор здоровья
+    health = "🟢 всё ок"
+    disk_pct = 0
+    m = re.search(r"(\d+)%", sysd.get("disk", ""))
+    if m:
+        disk_pct = int(m.group(1))
+    if not info["iface_up"] or disk_pct >= 90 or (online == 0 and len(clients) > 0):
+        health = "🔴 проблема"
+    elif disk_pct >= 75 or n_soon > 0 or "✗" in dns:
+        health = "🟡 внимание"
+
+    status_word = "активен" if info["iface_up"] else "остановлен"
     prof_raw = info.get("profile", "—")
-    prof_map = {"lite": "Lite", "standard": "Standard", "pro": "Pro"}
-    prof_label = prof_map.get(prof_raw, prof_raw if prof_raw != "—" else "—")
+    prof_label = {"lite": "Lite", "standard": "Standard", "pro": "Pro"}.get(
+        prof_raw, prof_raw if prof_raw != "—" else "—")
 
-    status_label = "active" if info["iface_up"] else "stopped"
+    # Сборка карточки (эмодзи слева, моноширинный блок)
+    lines = []
+    lines.append(f"📊 Статус · {health}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🖥 Сервер   {info['ip']}:{info['port']}")
+    lines.append(f"📡 awg0     {status_word} · {sysd['awg_uptime']}")
+    lines.append(f"🎭 Профиль  {prof_label}")
+    lines.append("")
+    lines.append(f"👥 Клиенты  {len(clients)} · {online} онлайн")
+    if n_exp:
+        lines.append(f"⏰ Срок     {n_exp} · 🚫{n_blocked} · ⚠️{n_soon} за 24ч")
+    lines.append("")
+    lines.append(f"📈 Трафик   ↓ {fmt_bytes(rx)} · ↑ {fmt_bytes(tx)}")
+    if top:
+        first = top[0]
+        lines.append(f"🔝 Топ      {first[0]} {_fmt_short(first[1])}")
+        for name, b in top[1:]:
+            lines.append(f"            {name} {_fmt_short(b)}")
+    lines.append("")
+    lines.append(f"☁️ WARP     {warp_line}")
+    lines.append(f"🌐 DNS      {dns}")
+    lines.append("")
+    lines.append(f"💾 Диск     {sysd['disk']}")
+    lines.append(f"🧠 RAM      {sysd['ram']} · LB {sysd['load']}")
+    lines.append(f"🔖 Версия   {ver}")
 
-    return (
-        "<pre>"
-        "AwgToolza\n"
-        "─────────────────────────────\n"
-        f"Profile   :  {prof_label}\n"
-        f"Address   :  {info['ip']}\n"
-        f"Port      :  {info['port']}\n"
-        f"Status    :  {status_label}\n"
-        f"Clients   :  {len(clients)}  ({online} online)\n"
-        f"Download  :  {fmt_bytes(rx)}\n"
-        f"Upload    :  {fmt_bytes(tx)}\n"
-        "─────────────────────────────"
-        "</pre>"
-    )
+    body = "\n".join(lines)
+    return f"<pre>{_html.escape(body)}</pre>"
 
 
 def text_client_card(c: dict) -> str:
@@ -1113,6 +1403,16 @@ def text_client_card(c: dict) -> str:
             expire_line = f"\n🚫 <b>Заблокирован</b> (срок истёк)\n   {expire_fmt(exp_ts)}"
         else:
             expire_line = f"\n⏰ Истекает: {expire_fmt(exp_ts)}"
+    # Заметка админа
+    note_line = ""
+    note = c.get("note", "")
+    if note:
+        esc = _html.escape(note)
+        # Если заметка — это URL, делаем кликабельной
+        if re.match(r"^https?://\S+$", note):
+            note_line = f'\n📝 <a href="{esc}">{esc}</a>'
+        else:
+            note_line = f"\n📝 {esc}"
     return (
         f"👤 <b>{c['name']}</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"🌐 IP: <code>{c['ip']}</code>\n"
@@ -1120,6 +1420,7 @@ def text_client_card(c: dict) -> str:
         f"↓ {s.get('rx', '—')}  ↑ {s.get('tx', '—')}"
         f"{warp_line}"
         f"{expire_line}"
+        f"{note_line}"
     )
 
 
@@ -1193,8 +1494,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _status_cache.invalidate()
     _live_stats_cache.invalidate()
-    await update.message.reply_text(
-        text_status(), parse_mode=ParseMode.HTML,
+    msg = await update.message.reply_text("⏳ Собираю статус...")
+    text_out = await asyncio.to_thread(text_status)
+    await msg.edit_text(
+        text_out, parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Обновить", callback_data="status")
         ]])
@@ -1263,6 +1566,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "expclear": _cb_expire_clear,
             "expunban": _cb_expire_unban,
             "expcustom": _cb_expire_custom_start,
+            "note":      _cb_note_menu,
+            "noteclear": _cb_note_clear,
         }
         handler = dispatch.get(prefix)
         if handler:
@@ -1285,8 +1590,10 @@ def _client_card_kb(name: str) -> InlineKeyboardMarkup:
     warp_on = warp_available() and warp_is_enabled_for(c["ip"])
     has_expire   = bool(c.get("expires", 0))
     is_suspended = has_expire and bool(c.get("orig_ip", ""))
+    has_note     = bool(c.get("note", ""))
     return kb.client_card(name, warp_on=warp_on,
-                          has_expire=has_expire, is_suspended=is_suspended)
+                          has_expire=has_expire, is_suspended=is_suspended,
+                          has_note=has_note)
 
 
 async def _cb_clients(q):
@@ -1327,8 +1634,10 @@ async def _cb_status(q):
     # Инвалидируем кэш чтобы показать актуальные данные
     _status_cache.invalidate()
     _live_stats_cache.invalidate()
+    await q.edit_message_text("⏳ Собираю статус...")
+    text_out = await asyncio.to_thread(text_status)
     await q.edit_message_text(
-        text_status(), parse_mode=ParseMode.HTML,
+        text_out, parse_mode=ParseMode.HTML,
         reply_markup=kb.status_refresh()
     )
 
@@ -1351,9 +1660,10 @@ async def _cb_restart(q):
 
 
 async def _cb_client_card(q, name: str, ctx):
-    # Сбросить флаг ожидания ввода даты, если пользователь вернулся в карточку
+    # Сбросить флаги ожидания ввода, если пользователь вернулся в карточку
     if ctx and hasattr(ctx, "user_data"):
         ctx.user_data.pop("awaiting_custom_expire", None)
+        ctx.user_data.pop("awaiting_note", None)
     clients = get_clients()
     c = next((x for x in clients if x["name"] == name), None)
     if not c:
@@ -1749,7 +2059,7 @@ async def _cb_expire_clear(q, name: str, ctx):
             reply_markup=_client_card_kb(name)
         )
     else:
-        await q.edit_message_text(f"✅ Срок снят — клиент бессрочный")
+        await q.edit_message_text("✅ Срок снят — клиент бессрочный")
 
 
 async def _cb_expire_unban(q, name: str, ctx):
@@ -1814,6 +2124,72 @@ async def _cb_expire_custom_start(q, name: str, ctx):
         parse_mode=ParseMode.HTML,
         reply_markup=cancel_kb
     )
+
+
+async def _cb_note_menu(q, name: str, ctx):
+    """Меню заметки: показать текущую + кнопки изменить/удалить, либо запрос ввода."""
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if not c:
+        await q.edit_message_text("❌ Клиент не найден")
+        return
+    cur = c.get("note", "")
+    # Ставим флаг ожидания ввода текста заметки
+    if ctx and hasattr(ctx, "user_data"):
+        ctx.user_data["awaiting_note"] = name
+
+    if cur:
+        rows = [
+            [InlineKeyboardButton("🗑 Удалить заметку", callback_data=f"noteclear:{name}")],
+            [InlineKeyboardButton("◀️ Отмена", callback_data=f"c:{name}")],
+        ]
+        body = (
+            f"📝 <b>Заметка: {name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Текущая:\n{_html.escape(cur)}\n\n"
+            f"Чтобы изменить — пришли новый текст сообщением.\n"
+            f"Или удали / отмени кнопкой ниже."
+        )
+    else:
+        rows = [[InlineKeyboardButton("◀️ Отмена", callback_data=f"c:{name}")]]
+        body = (
+            f"📝 <b>Заметка: {name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Пришли текст заметки сообщением.\n"
+            f"Например: <code>http://192.168.1.1</code> или "
+            f"<code>Кинетик, admin/12345</code>\n\n"
+            f"<i>До 200 символов. URL станет кликабельным.</i>"
+        )
+    await q.edit_message_text(
+        body, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+        disable_web_page_preview=True
+    )
+
+
+async def _cb_note_clear(q, name: str, ctx):
+    """Удалить заметку."""
+    if ctx and hasattr(ctx, "user_data"):
+        ctx.user_data.pop("awaiting_note", None)
+    ok_flag, msg = await asyncio.to_thread(note_clear, name)
+    _clients_cache.invalidate()
+    if not ok_flag:
+        await q.edit_message_text(
+            f"❌ Ошибка: {_html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name)
+        )
+        return
+    clients = get_clients()
+    c = next((x for x in clients if x["name"] == name), None)
+    if c:
+        await q.edit_message_text(
+            text_client_card(c), parse_mode=ParseMode.HTML,
+            reply_markup=_client_card_kb(name),
+            disable_web_page_preview=True
+        )
+    else:
+        await q.edit_message_text("🗑 Заметка удалена")
 
 
 async def _apply_custom_expire_to_existing(update: Update, name: str, ts: int):
@@ -2185,6 +2561,37 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _apply_custom_expire_to_existing(update, pending_name, ts)
         return
 
+    # Перехват ввода текста заметки (см. _cb_note_menu)
+    note_name = ctx.user_data.get("awaiting_note")
+    if note_name:
+        ctx.user_data.pop("awaiting_note", None)
+        if len(text) > 200:
+            await update.message.reply_text(
+                "❌ Заметка слишком длинная (макс 200 символов). Попробуй короче.",
+            )
+            ctx.user_data["awaiting_note"] = note_name  # остаёмся в режиме ввода
+            return
+        ok_flag, msg = await asyncio.to_thread(note_set, note_name, text)
+        _clients_cache.invalidate()
+        if not ok_flag:
+            await update.message.reply_text(
+                f"❌ Ошибка: {_html.escape(msg)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_client_card_kb(note_name)
+            )
+            return
+        clients = get_clients()
+        c = next((x for x in clients if x["name"] == note_name), None)
+        if c:
+            await update.message.reply_text(
+                text_client_card(c), parse_mode=ParseMode.HTML,
+                reply_markup=_client_card_kb(note_name),
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text("✅ Заметка сохранена")
+        return
+
     if text == "👥 Клиенты":
         clients = get_clients()
         if not clients:
@@ -2212,32 +2619,9 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "📊 Статус":
         _status_cache.invalidate()
         _live_stats_cache.invalidate()
-        rc, out, _ = await asyncio.to_thread(run, ["awg", "show", AWG_IFACE, "transfer"])
-        rx = tx = 0
-        for line in out.splitlines():
-            p = line.split()
-            if len(p) >= 3:
-                try:
-                    rx += int(p[1])
-                    tx += int(p[2])
-                except ValueError:
-                    pass
-        info    = get_server_info()
-        clients = get_clients()
-        stats   = get_live_stats()
-        online  = sum(
-            1 for c in clients
-            if stats.get(c["pubkey"], {}).get("last_hs", 0)
-            and (time.time() - stats[c["pubkey"]]["last_hs"]) < 300
-        )
-        text_out = (
-            f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
-            f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
-            f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
-            f"👥 {len(clients)} {plural_ru(len(clients), 'клиент', 'клиента', 'клиентов')}  🟢 {online} онлайн\n"
-            f"↓ {fmt_bytes(rx)}  ↑ {fmt_bytes(tx)}"
-        )
-        await update.message.reply_text(
+        msg = await update.message.reply_text("⏳ Собираю статус...")
+        text_out = await asyncio.to_thread(text_status)
+        await msg.edit_text(
             text_out, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Обновить", callback_data="status")
