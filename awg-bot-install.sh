@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
 # AWG Toolza Bot — менеджер
 # Меню: установка / удаление / обновление / логи / статус / перезапуск
@@ -475,7 +475,7 @@ EXPIRE_SUSPEND_IP = "127.0.0.2/32"
 # Проверяем хендшейки клиентов и орём в Telegram, если онлайн-клиент пропал.
 WATCHDOG_ENABLED   = True
 WATCHDOG_INTERVAL  = 30      # как часто проверять, сек
-WATCHDOG_OFFLINE   = 180     # нет хендшейка дольше этого = отвалился, сек (как 🔴)
+WATCHDOG_OFFLINE   = 300     # нет хендшейка дольше этого = отвалился, сек (как 🔴)
 WATCHDOG_GRACE     = 90      # после старта бота молчим столько сек (прогрев)
 
 ADD_NAME, ADD_PROFILE, ADD_EXPIRE, ADD_EXPIRE_CUSTOM, EXPIRE_CUSTOM_EXISTING = range(5)
