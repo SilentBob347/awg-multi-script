@@ -1752,19 +1752,28 @@ do_self_update() {
   echo -e "  ${W}Новая    : ${N}$new_ver"
   echo ""
 
-  # Хеш для отладки (помогает понять — реально ли разные версии)
-  if command -v sha256sum &>/dev/null; then
+ # Хеш для отладки (помогает понять — реально ли разные версии)
+if command -v sha256sum &>/dev/null; then
     local cur_hash new_hash
     cur_hash=$(sha256sum "$target" 2>/dev/null | cut -c1-12)
     new_hash=$(sha256sum "$tmp_file" 2>/dev/null | cut -c1-12)
+
     echo -e "  ${D}Хеши:    $cur_hash → $new_hash${N}"
+
     if [[ "$cur_hash" == "$new_hash" ]]; then
-      info "Файлы идентичны (тот же hash) — обновление не требуется"
-      rm -f "$tmp_file"
-      return 0
+        echo ""
+        echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+        echo -e "  ${W}Обновление не требуется${N}"
+        echo -e "  Текущая версия : ${VERSION}"
+        echo -e "  Последняя версия: ${new_ver}"
+        echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+        read -rp "Enter для возврата в меню..."
+        rm -f "$tmp_file"
+        return 0
     fi
+
     echo ""
-  fi
+fi
 
   # ───── 5. Сравнение версий ─────
   local cur_num new_num
