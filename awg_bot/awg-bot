@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# awg-bot — управление Telegram-ботом awgToolza.
+# Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
+set -euo pipefail
+
+VERSION="1.9.3"
+
+# ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
+# Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
+# Код бота лежит в подпапке awg_bot репозитория awg-multi-script
+# (там же, где сам awg2.sh). Структура подпапки: awgbot/, run.py, requirements.txt, ...
+DEFAULT_REPO_URL="https://github.com/pumbaX/awg-multi-script"
+# Подпапка с кодом бота внутри репо (пусто = корень репо).
+# Переопределяется строкой REPO_SUBDIR=... в /etc/awg-bot.conf
+DEFAULT_REPO_SUBDIR="awg_bot"
+
+DEST="/opt/awg-bot"
+CONF="/etc/awg-bot.conf"
+SERVICE="awg-bot.service"
+SELF="/usr/local/bin/awg-bot"
+
+R='\033[38;5;203m'; G='\033[0;32m'; Y='\033[0;33m'; C='\033[0;36m'
+W='\033[1;37m'; D='\033[0;90m'; B='\033[1;94m'; N='\033[0m'
+ok()   { echo -e "${G}  √ $*${N}"; }
+err()  { echo -e "${R}  × $*${N}"; }
+warn() { echo -e "${Y}  ▲ $*${N}"; }
+info() { echo -e "${C}  → $*${N}"; }
+hdr()  {
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}$*${N}"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+}
+
+[[ $EUID -ne 0 ]] && { err "Запускай от root (sudo awg-bot)"; exit 1; }
+
+# Читаем REPO_URL из конфига, если задан
+get_repo_url() {
+  local u=""
+  [[ -f "$CONF" ]] && u=$(grep -m1 '^REPO_URL=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+  echo "${u:-$DEFAULT_REPO_URL}"
+}
+
+get_repo_subdir() {
+  local s=""
+  [[ -f "$CONF" ]] && s=$(grep -m1 '^REPO_SUBDIR=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+  echo "${s:-$DEFAULT_REPO_SUBDIR}"
+}
+
+# Проверяет, что в каталоге есть файлы бота. Возвращает 0/1.
+validate_src() {
+  local src="$1"
+  [[ -d "$src/awgbot" && -f "$src/run.py" && -f "$src/requirements.txt" ]]
+}
+
+# Клонирует репо в $1 (mktemp -d) и эхает путь к корню кода (с учётом REPO_SUBDIR).
+# Возвращает 1 при ошибке клона или если структура не похожа на бота.
+clone_repo() {
+  local tmp="$1" url subdir src
+  url=$(get_repo_url); subdir=$(get_repo_subdir)
+  info "Клонирую ${url}…" >&2
+  if ! git clone --depth 1 "$url" "$tmp/repo" >/dev/null 2>&1; then
+    err "git clone не удался. Проверь REPO_URL в ${CONF} или доступ к сети." >&2
+    return 1
+  fi
+  src="$tmp/repo"
+  [[ -n "$subdir" ]] && src="$tmp/repo/$subdir"
+  if ! validate_src "$src"; then
+    err "В репозитории нет кода бота (awgbot/, run.py, requirements.txt)." >&2
+    warn "Похоже, это не репозиторий бота. Если бот лежит в подпапке —" >&2
+    warn "задай REPO_SUBDIR=имя_папки в ${CONF}." >&2
+    return 1
+  fi
+  echo "$src"
+}
+
+# Копирует код из $1 в $DEST (без венв и конфига).
+deploy_code() {
+  local src="$1"
+  rm -rf "$DEST/awgbot"
+  cp -r "$src/awgbot" "$DEST/"
+  cp "$src/run.py" "$src/requirements.txt" "$DEST/"
+  # сам management-скрипт и юнит — если есть в репо
+  [[ -f "$src/awg-bot" ]] && { cp "$src/awg-bot" "$SELF"; chmod +x "$SELF"; }
+}
+
+ensure_deps() {
+  command -v git >/dev/null 2>&1 || { info "Ставлю git…"; apt-get install -y -qq git >/dev/null; }
+  command -v python3 >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq python3 python3-venv; }
+}
+
+# ── 1) Переустановить (с нуля, спросит токен) ──
+do_reinstall() {
+  hdr "Переустановка с нуля"
+  warn "Будет перезаписан код в ${DEST} и переспрошены токен/ID."
+  read -rp "$(echo -e "${C}  Продолжить? [y/N]: ${N}")" c; [[ "${c,,}" == y* ]] || { warn "Отмена"; return; }
+  ensure_deps
+  local tmp; tmp=$(mktemp -d)
+  local src
+  if ! src=$(clone_repo "$tmp"); then rm -rf "$tmp"; return 1; fi
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  mkdir -p "$DEST"
+  deploy_code "$src"
+  rm -rf "$tmp"
+  # venv
+  [[ -d "$DEST/venv" ]] || python3 -m venv "$DEST/venv"
+  "$DEST/venv/bin/pip" install -q --upgrade pip
+  "$DEST/venv/bin/pip" install -q -r "$DEST/requirements.txt"
+  # токен/ID
+  read -rp "$(echo -e "${C}  Токен бота (@BotFather): ${N}")" BOT_TOKEN
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot): ${N}")" ADMIN_ID
+  touch "$CONF"; chmod 600 "$CONF"
+  sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
+  { echo "BOT_TOKEN=${BOT_TOKEN}"; echo "ADMIN_ID=${ADMIN_ID}"; } >> "$CONF"
+  install_service
+  systemctl restart "$SERVICE"
+  sleep 2
+  systemctl is-active --quiet "$SERVICE" && ok "Бот переустановлен и запущен" || err "Не стартует: journalctl -u awg-bot -n 30"
+}
+
+# ── 2) Обновить (сохраняя токен и chat_id) ──
+do_update() {
+  hdr "Обновление (токен и ID сохраняются)"
+  [[ -f "$CONF" ]] || { err "Нет ${CONF}. Сначала установи (п.1)."; return 1; }
+  ensure_deps
+  local tmp; tmp=$(mktemp -d)
+  local src
+  if ! src=$(clone_repo "$tmp"); then rm -rf "$tmp"; return 1; fi
+  # бэкап текущего кода на случай отката
+  local bak="${DEST}.bak.$(date +%s)"
+  cp -r "$DEST" "$bak" 2>/dev/null && info "Бэкап старой версии: $bak"
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  deploy_code "$src"
+  rm -rf "$tmp"
+  # зависимости (вдруг добавились новые)
+  "$DEST/venv/bin/pip" install -q --upgrade pip
+  "$DEST/venv/bin/pip" install -q -r "$DEST/requirements.txt"
+  systemctl restart "$SERVICE"
+  sleep 2
+  if systemctl is-active --quiet "$SERVICE"; then
+    ok "Обновлено. Токен и ID сохранены (${CONF} не тронут)."
+    # подчистим старые бэкапы, оставив 3 последних
+    ls -dt "${DEST}".bak.* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+  else
+    err "Новая версия не стартует — откатываю…"
+    rm -rf "$DEST/awgbot"; cp -r "$bak/awgbot" "$DEST/" 2>/dev/null || true
+    cp "$bak/run.py" "$bak/requirements.txt" "$DEST/" 2>/dev/null || true
+    systemctl restart "$SERVICE" 2>/dev/null || true
+    warn "Откат выполнен на предыдущую версию. Логи: journalctl -u awg-bot -n 30"
+  fi
+}
+
+# ── 3) Перезапустить сервис ──
+do_restart() {
+  systemctl restart "$SERVICE" && ok "Сервис перезапущен" || err "Не удалось"
+}
+
+# ── 4) Статус ──
+do_status() {
+  hdr "Статус бота"
+  systemctl is-active --quiet "$SERVICE" && echo -e "  Сервис: ${G}● активен${N}" || echo -e "  Сервис: ${R}○ остановлен${N}"
+  systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && echo -e "  Автозапуск: ${G}включён${N}" || echo -e "  Автозапуск: ${Y}выключен${N}"
+  echo -e "  Версия awg-bot: ${W}${VERSION}${N}"
+  echo -e "  Код: ${D}${DEST}${N}"
+  echo -e "  Репо: ${D}$(get_repo_url)${N}"
+  echo ""
+  systemctl status "$SERVICE" --no-pager -n 5 2>/dev/null || true
+}
+
+# ── 5) Логи (последние 50 строк) ──
+do_logs() {
+  hdr "Логи (последние 50 строк)"
+  journalctl -u "$SERVICE" --no-pager -n 50 2>/dev/null || warn "journalctl недоступен"
+}
+
+# ── 6) Удалить ──
+do_uninstall() {
+  hdr "Удаление бота"
+  warn "Будут удалены: сервис, код в ${DEST}."
+  read -rp "$(echo -e "${C}  Удалить также конфиг с токеном (${CONF})? [y/N]: ${N}")" delconf
+  read -rp "$(echo -e "${R}  Точно удалить бота? [y/N]: ${N}")" c
+  [[ "${c,,}" == y* ]] || { warn "Отмена"; return; }
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  systemctl disable "$SERVICE" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SERVICE"
+  systemctl daemon-reload
+  rm -rf "$DEST"
+  rm -f /usr/local/bin/awg-bot.py   # маркер для awg2 (пункт 6)
+  [[ "${delconf,,}" == y* ]] && { rm -f "$CONF"; info "Конфиг удалён"; }
+  ok "Бот удалён"
+}
+
+install_service() {
+  cat > "/etc/systemd/system/$SERVICE" << EOF
+[Unit]
+Description=awgToolza Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${DEST}
+ExecStart=${DEST}/venv/bin/python ${DEST}/run.py
+Restart=on-failure
+RestartSec=5
+Environment=AWG_BOT_CONF=${CONF}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+}
+
+show_menu() {
+  clear 2>/dev/null || true
+  hdr "awgToolza Bot — управление  (v${VERSION})"
+  echo ""
+  echo -e "  ${C}1)${N} Переустановить (с нуля, спросит токен)"
+  echo -e "  ${C}2)${N} Обновить (сохраняя токен и chat_id)"
+  echo -e "  ${C}3)${N} Перезапустить сервис"
+  echo -e "  ${C}4)${N} Статус"
+  echo -e "  ${C}5)${N} Логи (последние 50 строк)"
+  echo -e "  ${C}6)${N} Удалить"
+  echo -e "  ${C}0)${N} Выход"
+  echo ""
+}
+
+# Неинтерактивный режим: awg-bot update | restart | status | logs ...
+case "${1:-}" in
+  reinstall) do_reinstall; exit 0 ;;
+  update)    do_update;    exit 0 ;;
+  restart)   do_restart;   exit 0 ;;
+  status)    do_status;    exit 0 ;;
+  logs)      do_logs;      exit 0 ;;
+  uninstall) do_uninstall; exit 0 ;;
+esac
+
+while true; do
+  show_menu
+  read -rp "$(echo -e "${C}  Выбор [0-6]: ${N}")" CH
+  case "$CH" in
+    1) do_reinstall ;;
+    2) do_update ;;
+    3) do_restart ;;
+    4) do_status ;;
+    5) do_logs ;;
+    6) do_uninstall; exit 0 ;;
+    0) exit 0 ;;
+    *) warn "Неверный выбор" ;;
+  esac
+  echo ""
+  read -rp "$(echo -e "${D}  Enter — вернуться в меню…${N}")" _
+done
