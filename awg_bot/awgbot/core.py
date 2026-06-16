@@ -608,6 +608,66 @@ def fmt_uptime(seconds: int) -> str:
     return f"{m}м"
 
 
+# ───────────────────────── версии (бот и awg2) ─────────────────────────
+REPO_RAW = "https://raw.githubusercontent.com/pumbaX/awg-multi-script/main"
+AWG2_BIN_PATH = "/usr/local/bin/awg2"
+
+
+def bot_version_local() -> str:
+    """Версия установленного бота (из awgbot/__init__.py)."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        return "?"
+
+
+def _grep_version(text: str) -> str:
+    # ищем __version__ = "x.y.z" или VERSION="x.y.z"
+    m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'VERSION\s*=\s*["\']?v?([0-9][0-9.]*)["\']?', text)
+    return m.group(1) if m else "?"
+
+
+def awg2_version_local() -> str:
+    """Версия установленного awg2 (из шапки скрипта)."""
+    try:
+        text = open(AWG2_BIN_PATH, encoding="utf-8", errors="replace").read(8000)
+    except OSError:
+        return "не установлен"
+    # awg2 обычно содержит строку вида: SCRIPT_VERSION="6.9.3" или v6.9.3
+    m = re.search(r'(?:SCRIPT_)?VERSION\s*=\s*["\']?v?([0-9][0-9.]*)', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'AwgToolza\s+v?([0-9][0-9.]+)', text)
+    return m.group(1) if m else "?"
+
+
+def _fetch(url: str, timeout: int = 10) -> str | None:
+    """Тянет текст по URL через curl (без внешних зависимостей)."""
+    rc, out, _ = run(["curl", "-fsSL", "--max-time", str(timeout), url], timeout=timeout + 5)
+    return out if rc == 0 and out.strip() else None
+
+
+def bot_version_remote() -> str:
+    txt = _fetch(f"{REPO_RAW}/awg_bot/awgbot/__init__.py")
+    return _grep_version(txt) if txt else "?"
+
+
+def awg2_version_remote() -> str:
+    # читаем только начало awg2.sh, версия в шапке
+    txt = _fetch(f"{REPO_RAW}/awg2.sh")
+    if not txt:
+        return "?"
+    m = re.search(r'(?:SCRIPT_)?VERSION\s*=\s*["\']?v?([0-9][0-9.]*)', txt[:8000])
+    if m:
+        return m.group(1)
+    m = re.search(r'AwgToolza\s+v?([0-9][0-9.]+)', txt[:8000])
+    return m.group(1) if m else "?"
+
+
 def server_uptime() -> int:
     """
     Время работы интерфейса awg0 в секундах.

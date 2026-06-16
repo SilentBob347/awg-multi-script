@@ -876,10 +876,13 @@ async def cb_botctl(cq: CallbackQuery) -> None:
 async def cb_bot_status(cq: CallbackQuery) -> None:
     if not authorized(cq.from_user.id):
         return await deny(cq)
+    await cq.answer("Читаю статус…")
     rc, out, _ = await asyncio.to_thread(core.run, ["awg-bot", "status"])
-    txt = out.strip() or "awg-bot status недоступен"
-    await safe_edit(cq, f"<pre>{esc(txt[-3500:])}</pre>", kb.botctl_menu())
-    await cq.answer()
+    bl = core.bot_version_local()
+    a2l = core.awg2_version_local()
+    head = f"🤖 Версия бота: <b>{esc(bl)}</b>\n🛠 awg2: <b>{esc(a2l)}</b>\n\n"
+    body = out.strip() or "awg-bot status недоступен"
+    await safe_edit(cq, head + f"<pre>{esc(body[-3000:])}</pre>", kb.botctl_menu())
 
 
 @dp.callback_query(F.data == "bot_logs")
@@ -897,12 +900,42 @@ async def cb_bot_logs(cq: CallbackQuery) -> None:
 async def cb_bot_update(cq: CallbackQuery) -> None:
     if not authorized(cq.from_user.id):
         return await deny(cq)
+    await cq.answer("Проверяю версии…")
+    # читаем версии (сетевые — в потоке, чтобы не блокировать)
+    bl = core.bot_version_local()
+    br = await asyncio.to_thread(core.bot_version_remote)
+    a2l = core.awg2_version_local()
+    a2r = await asyncio.to_thread(core.awg2_version_remote)
+
+    def arrow(loc, rem):
+        if rem in ("?", loc):
+            return f"<code>{esc(loc)}</code>" + ("  (актуально)" if rem == loc else "")
+        return f"<code>{esc(loc)}</code> → <code>{esc(rem)}</code>  ⬆️"
+
+    bot_upd = br not in ("?", bl)
+    txt = (
+        "⬆️ <b>Обновление</b>\n\n"
+        f"🤖 Бот: {arrow(bl, br)}\n"
+        f"🛠 awg2: {arrow(a2l, a2r)}\n\n"
+    )
+    if bot_upd:
+        txt += "Обновить бота до новой версии? Бот перезапустится, токен сохранится."
+    else:
+        txt += ("Бот уже актуален. Можно переустановить принудительно "
+                "(на случай повреждённых файлов).")
+    # awg2 обновляется отдельно — через консоль, мы его не трогаем
+    if a2r not in ("?", a2l):
+        txt += "\n\nℹ️ Для awg2 есть обновление — оно ставится в консоли: <code>sudo awg2</code> → пункт 8."
+    await safe_edit(cq, txt, kb.confirm(yes_cb="bot_update_ok", no_cb="botctl", danger=False))
+
+
+@dp.callback_query(F.data == "bot_update_ok")
+async def cb_bot_update_ok(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
     await cq.answer("Обновляю бота из GitHub…")
     await safe_edit(cq, "⏳ Тяну свежую версию и перезапускаю бота…\n"
-                        "Если обновление успешно — это сообщение может остаться, "
-                        "так как бот перезапустится. Проверь /start через ~10 сек.",
-                    kb.back_button("maint"))
-    # awg-bot update сам остановит/перезапустит сервис (этот процесс тоже)
+                        "Проверь /start через ~10 сек.", None)
     await asyncio.to_thread(core.run, ["awg-bot", "update"], 300)
 
 
@@ -924,6 +957,37 @@ async def cb_bot_restart_ok(cq: CallbackQuery) -> None:
     await safe_edit(cq, "↻ Перезапуск бота… нажми /start через несколько секунд.",
                     None)
     await asyncio.to_thread(core.run, ["systemctl", "restart", "awg-bot.service"])
+
+
+@dp.callback_query(F.data == "bot_uninstall_confirm")
+async def cb_bot_uninstall_confirm(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await safe_edit(cq,
+        "🗑 <b>Удалить бота полностью?</b>\n\n"
+        "Будут остановлены и удалены сервис, код в /opt/awg-bot и команда awg-bot. "
+        "Конфиг VPN и клиенты <b>не трогаются</b> — только бот.\n\n"
+        "Токен в /etc/awg-bot.conf сохранится (на случай переустановки). "
+        "После удаления бот перестанет отвечать.",
+        kb.confirm(yes_cb="bot_uninstall_ok", no_cb="botctl", danger=True))
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "bot_uninstall_ok")
+async def cb_bot_uninstall_ok(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await cq.answer("Удаляю бота…")
+    await safe_edit(cq,
+        "🗑 Удаляю бота…\n\nСервис остановится через пару секунд. "
+        "Спасибо, что пользовался! Переустановить можно через awg2 → пункт 6 "
+        "или <code>sudo awg-bot</code>.", None)
+    # запускаем удаление в фоне через management-скрипт (он сам остановит сервис).
+    # nohup + setsid, чтобы процесс пережил остановку нашего сервиса.
+    await asyncio.to_thread(
+        core.run,
+        ["bash", "-c", "setsid awg-bot uninstall --yes >/var/log/awg-bot-uninstall.log 2>&1 &"]
+    )
 
 
 @dp.callback_query(F.data == "backup")
