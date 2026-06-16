@@ -847,17 +847,6 @@ async def cb_show_logs(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "update_awg2")
-async def cb_update_awg2(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
-    await cq.answer("Запускаю обновление awg2…")
-    if not wrapper.available():
-        return await safe_edit(cq, "⚠️ pexpect недоступен — обнови awg2 в консоли.", kb.maint_menu())
-    ok, out = await asyncio.to_thread(wrapper.run_menu_sequence, ["8", "0"])
-    await safe_edit(cq, f"<pre>{esc((out or '')[-1500:])}</pre>", kb.maint_menu())
-
-
 # ───────────────────────── управление самим ботом ─────────────────────────
 @dp.callback_query(F.data == "botctl")
 async def cb_botctl(cq: CallbackQuery) -> None:
@@ -935,8 +924,14 @@ async def cb_bot_update_ok(cq: CallbackQuery) -> None:
         return await deny(cq)
     await cq.answer("Обновляю бота из GitHub…")
     await safe_edit(cq, "⏳ Тяну свежую версию и перезапускаю бота…\n"
-                        "Проверь /start через ~10 сек.", None)
-    await asyncio.to_thread(core.run, ["awg-bot", "update"], 300)
+                        "Через ~15-20 сек нажми /start — увидишь новую версию.", None)
+    # ВАЖНО: update останавливает сервис в процессе, что убивает и нас.
+    # Поэтому запускаем его отвязанным процессом (setsid), который переживёт
+    # остановку бота и докатит обновление с рестартом до конца.
+    await asyncio.to_thread(
+        core.run,
+        ["bash", "-c", "setsid awg-bot update >/var/log/awg-bot-update.log 2>&1 &"]
+    )
 
 
 @dp.callback_query(F.data == "bot_restart_confirm")

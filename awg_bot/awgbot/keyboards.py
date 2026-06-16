@@ -31,7 +31,7 @@ def main_menu(installed: bool) -> InlineKeyboardMarkup:
         b.button(text="💾 Бэкап / Рестор", callback_data="backup")
         b.button(text="↻ Перезапуск awg0", callback_data="restart_confirm")
         b.button(text="🔧 Обслуживание", callback_data="maint")
-        b.button(text="❤️ Поддержать проект", url="https://t.me/awgToolza/156/157")
+        b.button(text="❤️ Поддержать", url="https://t.me/awgToolza/156/157")
         b.adjust(2, 2, 2, 2)
     else:
         b.button(text="⚙️ Сервер не установлен — открыть консоль awg2",
@@ -192,10 +192,9 @@ def maint_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📄 Конфиг сервера (скачать)", callback_data="show_server_conf")
     b.button(text="📜 Логи awg2", callback_data="show_logs")
-    b.button(text="⬆️ Обновить awg2", callback_data="update_awg2")
     b.button(text="🤖 Управление ботом", callback_data="botctl")
     b.button(text="‹ Назад", callback_data="menu")
-    b.adjust(1, 1, 1, 1, 1)
+    b.adjust(1, 1, 1, 1)
     return b.as_markup()
 
 
