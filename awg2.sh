@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.3"
+VERSION="v6.9.4"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -3709,24 +3709,96 @@ do_bulk_add_clients() {
   echo -e "  ${D}Профиль    : ${_srv_profile}${N}"
   echo ""
 
-  # ── Префикс ──
-  local prefix
-  read -rp "$(echo -e "${C}  Префикс имени (напр. bulk, user, phone): ${N}")" prefix
-  if [[ -z "$prefix" ]]; then warn "Префикс не может быть пустым — возврат"; return 0; fi
-  if ! [[ "$prefix" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    warn "Префикс содержит недопустимые символы (только A-Z, a-z, 0-9, _, -) — возврат"
-    return 0
-  fi
-
-  # ── Количество ──
-  local count
+  # ── Режим именования ──
+  #   1) Префикс + N   → prefix-001, prefix-002 ...
+  #   2) Список имён   → iPhone, Mama, MacOS ... (через запятую)
+  local NAME_MODE prefix count
   local max_count=$free_count
   (( max_count > 200 )) && max_count=200
-  while true; do
-    read -rp "$(echo -e "${C}  Сколько клиентов создать [1-${max_count}]: ${N}")" count
-    [[ "$count" =~ ^[0-9]+$ ]] && (( count >= 1 && count <= max_count )) && break
-    warn "Нужно число 1-${max_count}"
-  done
+
+  # _names[] заполняется только в режиме списка; пусто = режим префикса
+  local _names=()
+
+  hdr "≡  Способ именования"
+  echo "  1) Префикс + количество  (prefix-001, prefix-002 ...)"
+  echo "  2) Список имён через запятую  (iPhone, Mama, MacOS ...)"
+  read_choice NAME_MODE "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
+
+  if (( NAME_MODE == 2 )); then
+    # ── Список имён через запятую ──
+    local _raw _seen=" "
+    read -rp "$(echo -e "${C}  Имена через запятую: ${N}")" _raw
+    if [[ -z "$_raw" ]]; then warn "Список пуст — возврат"; return 0; fi
+
+    local _part _name _skipped_names=0
+    local _oldifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2206  # намеренное разбиение по запятой
+    local _arr=($_raw)
+    IFS="$_oldifs"
+
+    for _part in "${_arr[@]}"; do
+      # trim пробелов по краям
+      _name="${_part#"${_part%%[![:space:]]*}"}"
+      _name="${_name%"${_name##*[![:space:]]}"}"
+      [[ -z "$_name" ]] && continue
+      # пробелы внутри → _
+      _name="${_name// /_}"
+      # выкидываем всё, кроме A-Za-z0-9_-
+      _name="$(printf '%s' "$_name" | tr -cd 'A-Za-z0-9_-')"
+      [[ -z "$_name" ]] && { warn "Пропущено: '$_part' (нет валидных символов)"; _skipped_names=$((_skipped_names+1)); continue; }
+      # обрезка до 15 символов
+      _name="${_name:0:15}"
+
+      # дубль внутри введённого списка?
+      if [[ "$_seen" == *" ${_name} "* ]]; then
+        warn "Пропущено: '$_name' (дубль в списке)"
+        _skipped_names=$((_skipped_names+1))
+        continue
+      fi
+      # дубль среди существующих клиентов?
+      if grep -qx "# ${_name}" "$SERVER_CONF" 2>/dev/null || [[ -f "/root/${_name}_awg2.conf" ]]; then
+        warn "Пропущено: '$_name' (клиент уже существует)"
+        _skipped_names=$((_skipped_names+1))
+        continue
+      fi
+      _names+=("$_name")
+      _seen+="${_name} "
+    done
+
+    if (( ${#_names[@]} == 0 )); then warn "После очистки не осталось имён — возврат"; return 0; fi
+
+    # не больше свободных IP
+    if (( ${#_names[@]} > max_count )); then
+      warn "Имён ${#_names[@]}, но свободно только ${max_count} IP — лишние будут отброшены"
+      _names=("${_names[@]:0:max_count}")
+    fi
+
+    count=${#_names[@]}
+    echo ""
+    info "К созданию (${count}): ${_names[*]}"
+    (( _skipped_names > 0 )) && warn "Отброшено при разборе: ${_skipped_names}"
+  else
+    # ── Префикс ──
+    read -rp "$(echo -e "${C}  Префикс имени (напр. bulk, user, phone): ${N}")" prefix
+    if [[ -z "$prefix" ]]; then warn "Префикс не может быть пустым — возврат"; return 0; fi
+    if ! [[ "$prefix" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      warn "Префикс содержит недопустимые символы (только A-Z, a-z, 0-9, _, -) — возврат"
+      return 0
+    fi
+    # 15-символьный лимит на имя: prefix + "-NNN" (4 символа)
+    if (( ${#prefix} > 11 )); then
+      warn "Префикс длиннее 11 символов — имена prefix-NNN превысят 15 символов. Возврат"
+      return 0
+    fi
+
+    # ── Количество ──
+    while true; do
+      read -rp "$(echo -e "${C}  Сколько клиентов создать [1-${max_count}]: ${N}")" count
+      [[ "$count" =~ ^[0-9]+$ ]] && (( count >= 1 && count <= max_count )) && break
+      warn "Нужно число 1-${max_count}"
+    done
+  fi
 
   # ── Пауза ──
   local pause
@@ -3806,7 +3878,12 @@ do_bulk_add_clients() {
   # ── Подтверждение ──
   echo ""
   hdr "≡  Готов к запуску"
-  echo -e "  ${W}Префикс   : ${N}${prefix}-NNN"
+  if (( NAME_MODE == 2 )); then
+    echo -e "  ${W}Режим     : ${N}список имён"
+    echo -e "  ${W}Имена     : ${N}${_names[*]}"
+  else
+    echo -e "  ${W}Префикс   : ${N}${prefix}-NNN"
+  fi
   echo -e "  ${W}Количество: ${N}${count}"
   echo -e "  ${W}Пауза     : ${N}${pause} сек"
   echo -e "  ${W}DNS       : ${N}${CLIENT_DNS}"
@@ -3847,19 +3924,23 @@ do_bulk_add_clients() {
       break
     fi
 
-    # Подбор уникального имени: prefix-001, prefix-002 ...
+    # Имя: из списка (режим 2) либо prefix-NNN (режим 1)
     name=""
-    while (( name_idx <= 9999 )); do
-      printf -v suffix "%03d" "$name_idx"
-      candidate="${prefix}-${suffix}"
-      candidate_file="/root/${candidate}_awg2.conf"
-      if [[ ! -f "$candidate_file" ]] && ! grep -qE "^# ${candidate}$" "$SERVER_CONF" 2>/dev/null; then
-        name="$candidate"
+    if (( NAME_MODE == 2 )); then
+      name="${_names[created]}"
+    else
+      while (( name_idx <= 9999 )); do
+        printf -v suffix "%03d" "$name_idx"
+        candidate="${prefix}-${suffix}"
+        candidate_file="/root/${candidate}_awg2.conf"
+        if [[ ! -f "$candidate_file" ]] && ! grep -qE "^# ${candidate}$" "$SERVER_CONF" 2>/dev/null; then
+          name="$candidate"
+          name_idx=$((name_idx+1))
+          break
+        fi
         name_idx=$((name_idx+1))
-        break
-      fi
-      name_idx=$((name_idx+1))
-    done
+      done
+    fi
 
     if [[ -z "$name" ]]; then
       warn "Не удалось подобрать свободное имя — стоп"
