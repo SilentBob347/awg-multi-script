@@ -3111,10 +3111,11 @@ do_manage_clients() {
     echo -e "  ${G}6)${N} Создать N клиентов (массово)"
     echo -e "  ${C}7)${N} Срок действия клиента"
     echo -e "  ${C}8)${N} Активность клиентов"
+    echo -e "  ${C}9)${N} Экспорт конфигов (zip)"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
+    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client || true ;;
       2) do_rename_client || true ;;
@@ -3124,6 +3125,7 @@ do_manage_clients() {
       6) do_bulk_add_clients || true ;;
       7) do_expire_menu || true ;;
       8) do_list_clients || true ;;
+      9) do_export_configs || true ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3298,49 +3300,27 @@ do_rename_client() {
 }
 
 # ── Удаление клиента ──
-do_delete_client() {
-  _mgmt_scan_clients || { warn "Нет клиентов для удаления"; return 0; }
-  hdr "🗑  Удалить клиента"
-  _mgmt_print_list
-
-  local SEL
-  safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
-  [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
-  if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
-    warn "Неверный номер"; return 0
-  fi
-
-  local idx=$((SEL - 1))
-  local del_name="${MGMT_NAMES[$idx]}"
-  local del_pk="${MGMT_PUBKEYS[$idx]}"
-  local del_ip="${MGMT_IPS[$idx]}"
-
-  echo ""
-  echo -e "${Y}  ▲ Будет удалён клиент:${N}"
-  echo -e "     Имя: ${W}$del_name${N}"
-  echo -e "     IP : ${W}$del_ip${N}"
-  echo -e "     Ключ: ${D}${del_pk:0:20}...${N}"
-  echo ""
-  local CONFIRM
-  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")"
-  [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
-
-  # Бекап
-  local bak
-  bak="${SERVER_CONF}.pre_delete.$(date +%s)"
-  cp "$SERVER_CONF" "$bak"
+# ─────────────────────────────────────────────────────────────
+# _delete_one_peer — удаляет ОДНОГО пира по pubkey+name.
+#   Делает: awg remove (runtime) + вырезание [Peer] из SERVER_CONF (awk)
+#           + удаление файла клиента + чистка expire-флага.
+#   НЕ делает: backup, _apply_config, _warp_sync_peers — это задача вызывающего
+#              (чтобы при массовом удалении делать их один раз).
+#   Аргументы: $1=name  $2=pubkey  $3=ip(для лога)
+#   Возврат: 0 — ок, 1 — awk-ошибка (конфиг не тронут)
+# ─────────────────────────────────────────────────────────────
+_delete_one_peer() {
+  local del_name="$1" del_pk="$2" del_ip="${3:-?}"
 
   # Удаляем peer из runtime
-  awg set awg0 peer "$del_pk" remove 2>/dev/null || warn "Не удалось удалить peer из runtime"
+  awg set awg0 peer "$del_pk" remove 2>/dev/null || warn "[$del_name] не удалось удалить peer из runtime"
 
-  # Удаляем блок [Peer] из SERVER_CONF через awk
-  # Стратегия: буферизуем каждый [Peer] блок целиком, печатаем только если его PublicKey != del_pk
+  # Вырезаем блок [Peer] из SERVER_CONF через awk (буферизуем блок, печатаем если PublicKey != del_pk)
   local tmp_conf
   tmp_conf=$(mktemp)
   awk -v pk="$del_pk" '
     BEGIN { in_peer=0; peer_buf=""; match_pk=0 }
     /^\[Peer\]/ {
-      # Печатаем предыдущий peer если он не удаляется
       if (in_peer && !match_pk) printf "%s", peer_buf
       in_peer=1
       peer_buf=$0 "\n"
@@ -3366,8 +3346,7 @@ do_delete_client() {
   ' "$SERVER_CONF" > "$tmp_conf"
 
   if [[ ! -s "$tmp_conf" ]]; then
-    err "awk не смог обработать конфиг, восстанавливаю из бекапа"
-    mv "$bak" "$SERVER_CONF"
+    err "[$del_name] awk не смог обработать конфиг — пропуск (конфиг не тронут)"
     rm -f "$tmp_conf"
     return 1
   fi
@@ -3379,7 +3358,6 @@ do_delete_client() {
   local del_file="/root/${del_name}_awg2.conf"
   if [[ -f "$del_file" && "$del_name" != "безымянный" ]]; then
     rm -f "$del_file"
-    ok "Файл удалён: $(basename "$del_file")"
   fi
 
   # Чистим expire-warn флаг если был
@@ -3389,10 +3367,114 @@ do_delete_client() {
     rm -f "${EXPIRE_STATE_DIR}/warn1h_${safe_pk}" 2>/dev/null || true
   fi
 
-  ok "Клиент удалён: $del_name ($del_ip)"
+  ok "Удалён: $del_name ($del_ip)"
+  return 0
+}
+
+do_delete_client() {
+  _mgmt_scan_clients || { warn "Нет клиентов для удаления"; return 0; }
+  hdr "🗑  Удалить клиента"
+  _mgmt_print_list
+
+  # ── Режим удаления ──
+  echo -e "  ${C}1)${N} По номеру (один клиент)"
+  echo -e "  ${C}2)${N} Список имён через запятую (массово)"
+  local DEL_MODE
+  read_choice DEL_MODE "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
+
+  # Индексы клиентов к удалению (0-based в MGMT_*)
+  local _del_idx=()
+
+  if (( DEL_MODE == 2 )); then
+    # ── Массово: список имён через запятую ──
+    local _raw
+    read -rp "$(echo -e "${C}  Имена через запятую: ${N}")" _raw
+    [[ -z "$_raw" ]] && { info "Отменено"; return 0; }
+
+    local _oldifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2206
+    local _arr=($_raw)
+    IFS="$_oldifs"
+
+    local _part _name _i _found _seen=" " _missing=()
+    for _part in "${_arr[@]}"; do
+      # trim
+      _name="${_part#"${_part%%[![:space:]]*}"}"
+      _name="${_name%"${_name##*[![:space:]]}"}"
+      [[ -z "$_name" ]] && continue
+      # дубль в вводе
+      [[ "$_seen" == *" ${_name} "* ]] && continue
+      _seen+="${_name} "
+      # ищем по имени среди MGMT_NAMES
+      _found=-1
+      for _i in "${!MGMT_NAMES[@]}"; do
+        if [[ "${MGMT_NAMES[$_i]}" == "$_name" ]]; then _found=$_i; break; fi
+      done
+      if (( _found >= 0 )); then
+        _del_idx+=("$_found")
+      else
+        _missing+=("$_name")
+      fi
+    done
+
+    if (( ${#_missing[@]} > 0 )); then
+      warn "Не найдены (пропущены): ${_missing[*]}"
+    fi
+    if (( ${#_del_idx[@]} == 0 )); then
+      warn "Ни одно имя не совпало с существующими клиентами — возврат"
+      return 0
+    fi
+
+    echo ""
+    echo -e "${Y}  ▲ Будут удалены (${#_del_idx[@]}):${N}"
+    local _x
+    for _x in "${_del_idx[@]}"; do
+      echo -e "     • ${W}${MGMT_NAMES[$_x]}${N} ${D}(${MGMT_IPS[$_x]})${N}"
+    done
+  else
+    # ── Один по номеру ──
+    local SEL
+    safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
+    [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
+    if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
+      warn "Неверный номер"; return 0
+    fi
+    local idx=$((SEL - 1))
+    _del_idx=("$idx")
+
+    echo ""
+    echo -e "${Y}  ▲ Будет удалён клиент:${N}"
+    echo -e "     Имя: ${W}${MGMT_NAMES[$idx]}${N}"
+    echo -e "     IP : ${W}${MGMT_IPS[$idx]}${N}"
+    echo -e "     Ключ: ${D}${MGMT_PUBKEYS[$idx]:0:20}...${N}"
+  fi
+
+  echo ""
+  local CONFIRM
+  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")"
+  [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
+
+  # Один общий бекап перед серией удалений
+  local bak
+  bak="${SERVER_CONF}.pre_delete.$(date +%s)"
+  cp "$SERVER_CONF" "$bak"
+
+  # Удаляем по очереди
+  local _x _deleted=0 _failed=0
+  for _x in "${_del_idx[@]}"; do
+    if _delete_one_peer "${MGMT_NAMES[$_x]}" "${MGMT_PUBKEYS[$_x]}" "${MGMT_IPS[$_x]}"; then
+      _deleted=$((_deleted+1))
+    else
+      _failed=$((_failed+1))
+    fi
+  done
+
+  echo ""
+  ok "Удалено: ${_deleted}$( ((_failed>0)) && echo ", ошибок: ${_failed}")"
   info "Бекап конфига: $bak"
 
-  # Синхронизируем peers.list — убираем удалённого клиента из Warp
+  # Один sync в конце — убираем удалённых из Warp
   if declare -f _warp_sync_peers >/dev/null 2>&1; then
     _warp_sync_peers 2>/dev/null || true
   fi
@@ -4053,6 +4135,75 @@ do_bulk_add_clients() {
   done
 }
 
+# ─────────────────────────────────────────────────────────────
+# do_export_configs — собирает все клиентские *_awg2.conf из /root
+# в один архив. Приоритет zip, fallback tar.gz (zip не везде есть).
+# Серверный конфиг (awg0.conf) НЕ включается — только клиенты.
+# ─────────────────────────────────────────────────────────────
+do_export_configs() {
+  hdr "📦  Экспорт конфигов клиентов"
+
+  # Собираем список клиентских конфигов (без серверного awg0/SERVER_CONF)
+  local srv_base
+  srv_base=$(basename "${SERVER_CONF:-/etc/amnezia/amneziawg/awg0.conf}")
+  local files=() f
+  for f in /root/*_awg2.conf; do
+    [[ -e "$f" ]] || continue
+    [[ "$(basename "$f")" == "$srv_base" ]] && continue
+    files+=("$f")
+  done
+
+  if (( ${#files[@]} == 0 )); then
+    warn "Клиентских конфигов (*_awg2.conf) в /root не найдено — возврат"
+    return 0
+  fi
+
+  echo -e "  ${C}Найдено конфигов: ${W}${#files[@]}${N}"
+  local _bn
+  for f in "${files[@]}"; do _bn=$(basename "$f"); echo -e "    ${D}• ${_bn}${N}"; done
+  echo ""
+
+  local CONFIRM
+  read_yesno CONFIRM "$(echo -e "${C}  Создать архив? [Y/n]: ${N}")" "y"
+  [[ "$CONFIRM" != "y" ]] && { info "Отменено"; return 0; }
+
+  local stamp out base_names=()
+  stamp=$(date +%Y%m%d_%H%M%S)
+  for f in "${files[@]}"; do base_names+=("$(basename "$f")"); done
+
+  # zip приоритетно (запароленный архив с -e? — нет, без интерактива, просто zip)
+  if command -v zip &>/dev/null; then
+    out="/root/awg_clients_${stamp}.zip"
+    # -j: без путей внутри архива (только имена файлов)
+    if (cd /root && zip -j -q "$out" "${base_names[@]}"); then
+      chmod 600 "$out"
+      success_box "📦  Готово: $(basename "$out")"
+      echo -e "${W}  Путь   : ${N}${out}"
+      echo -e "${W}  Файлов : ${N}${#files[@]}"
+      info "Скачать: scp root@SERVER:${out} ."
+      return 0
+    fi
+    warn "zip не сработал — пробую tar.gz"
+  fi
+
+  # Fallback: tar.gz
+  if command -v tar &>/dev/null; then
+    out="/root/awg_clients_${stamp}.tar.gz"
+    if (cd /root && tar -czf "$out" "${base_names[@]}" 2>/dev/null); then
+      chmod 600 "$out"
+      success_box "📦  Готово: $(basename "$out")"
+      echo -e "${W}  Путь   : ${N}${out}"
+      echo -e "${W}  Файлов : ${N}${#files[@]}"
+      info "Скачать: scp root@SERVER:${out} ."
+      info "Распаковать: tar -xzf $(basename "$out")"
+      return 0
+    fi
+  fi
+
+  err "Ни zip, ни tar не доступны — установи: apt-get install zip"
+  return 1
+}
+
 do_list_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "Конфиг сервера не найден"; return 1; }
 
@@ -4070,7 +4221,7 @@ do_list_clients() {
   endpoint_cache=$(awg show awg0 endpoints 2>/dev/null || true)
 
   local i=0
-  local name="" pubkey="" ip="" tx_raw=0 rx_raw=0 handshake_time="" endpoint=""
+  local name="" pubkey="" ip="" tx_raw=0 rx_raw=0 handshake_time="" endpoint="" expire_ts=""
   
   while IFS= read -r line; do
     if [[ "$line" =~ ^\[Peer\] ]]; then
@@ -4078,10 +4229,12 @@ do_list_clients() {
         # Нормализуем значения перед арифметикой
         tx_raw=${tx_raw:-0}
         rx_raw=${rx_raw:-0}
-        _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
+        _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint" "$expire_ts"
       fi
       i=$((i+1))
-      name=""; pubkey=""; ip=""; tx_raw=0; rx_raw=0; handshake_time=""; endpoint=""
+      name=""; pubkey=""; ip=""; tx_raw=0; rx_raw=0; handshake_time=""; endpoint=""; expire_ts=""
+    elif [[ "$line" =~ ^#[[:space:]]*expires=([0-9]+) ]]; then
+      expire_ts="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^#[[:space:]](.+) ]]; then
       _cmt="${BASH_REMATCH[1]}"
       # Пропускаем служебные метки expires= и orig_ips=
@@ -4110,7 +4263,7 @@ do_list_clients() {
   if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
     tx_raw=${tx_raw:-0}
     rx_raw=${rx_raw:-0}
-    _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
+    _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint" "$expire_ts"
   fi
 
   if [[ $i -eq 0 ]]; then
@@ -4134,6 +4287,7 @@ _print_client_info() {
   [[ "$rx_raw" =~ ^[0-9]+$ ]] || rx_raw=0
   local handshake_time="$6"
   local endpoint="$7"
+  local expire_ts="$8"
   
   local display_name="${name:-безымянный}"
   display_name="${display_name:0:15}"
@@ -4195,6 +4349,20 @@ _print_client_info() {
   echo -e "  ${W}│${N}  ∑ Статус:   $status_icon $status_text"
   if [[ -n "$endpoint_short" ]]; then
     echo -e "  ${W}│${N}  » Endpoint: ${Y}$endpoint_short${N}"
+  fi
+  # Срок действия (expire), если задан
+  if [[ -n "$expire_ts" && "$expire_ts" =~ ^[0-9]+$ ]]; then
+    local _now_ts _exp_str _exp_color
+    _now_ts=$(date +%s)
+    _exp_str=$(_expire_fmt "$expire_ts" 2>/dev/null || echo "ts=$expire_ts")
+    if (( expire_ts <= _now_ts )); then
+      _exp_color="$R"        # истёк
+    elif (( expire_ts - _now_ts < 86400 )); then
+      _exp_color="$Y"        # меньше суток
+    else
+      _exp_color="$G"
+    fi
+    echo -e "  ${W}│${N}  ⌛ Срок:     ${_exp_color}${_exp_str}${N}"
   fi
   echo -e "  ${W}└─────────────────────────────────────────────────────────────────────────${N}"
 }
