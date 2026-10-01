@@ -21,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            Message, WebAppInfo)
 
-from . import api, icons
+from . import access, api, icons
 
 log = logging.getLogger("awgbot.ui")
 
@@ -162,13 +162,46 @@ HOME: Button = ("🏠 Главное меню", "main")
 # ── Текст ─────────────────────────────────────────────────
 def pre(text: str, limit: int = 3000, tail: bool = True) -> str:
     """Моноширинный блок. Длинный текст режется: по умолчанию остаётся
-    конец — в журналах важны последние строки."""
-    text = (text or "").strip("\n")
+    конец — в журналах важны последние строки. Лимит — по уже экранированному
+    HTML: «"» становится &quot;, и вывод make/gcc с кавычками иначе вылезал
+    за 4096 после esc(), а срез сырого HTML рвал <pre>."""
+    text = esc((text or "").strip("\n"))
     if not text:
         return ""
     if len(text) > limit:
-        text = ("…\n" + text[-limit:]) if tail else (text[:limit] + "\n…")
-    return f"<pre>{esc(text)}</pre>"
+        if tail:
+            text = text[-limit:]
+            # Начать с целой строки (журналы построчные); нет переноса рядом —
+            # хотя бы не с огрызка сущности вроде «uot;»
+            nl = text.find("\n")
+            text = text[nl + 1:] if 0 <= nl < 200 else re.sub(r"^[a-z0-9#]{0,5};", "", text)
+            text = "…\n" + text
+        else:
+            text = re.sub(r"&[^;&]{0,6}$", "", text[:limit]) + "\n…"
+    return f"<pre>{text}</pre>"
+
+
+def clip(text: str, limit: int = TEXT_MAX) -> str:
+    """Укоротить HTML под лимит Telegram, не разрывая тег или &сущность; и
+    закрыть открытые теги. Лимит Telegram — по разобранному тексту, поэтому
+    сырой HTML не длиннее лимита трогать не нужно."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 16]
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:
+        cut = cut[:lt]
+    amp, semi = cut.rfind("&"), cut.rfind(";")
+    if amp > semi:
+        cut = cut[:amp]
+    open_tags: list[str] = []
+    for m in re.finditer(r"<(/?)([a-z][a-z0-9-]*)[^>]*>", cut):   # и <tg-emoji …>
+        if m.group(1):
+            if open_tags and open_tags[-1] == m.group(2):
+                open_tags.pop()
+        else:
+            open_tags.append(m.group(2))
+    return cut + "…" + "".join(f"</{t}>" for t in reversed(open_tags))
 
 
 def fmt_bytes(n: int | None) -> str:
@@ -280,7 +313,7 @@ def is_screen(chat_id: int, msg_id: int) -> bool:
 
 async def show_new(bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> Message:
     """Новое сообщение-экран внизу чата."""
-    msg = await bot.send_message(chat_id, fit(text[:TEXT_MAX], markup), reply_markup=markup,
+    msg = await bot.send_message(chat_id, fit(clip(text), markup), reply_markup=markup,
                                  disable_web_page_preview=True)
     _screen[chat_id] = msg.message_id
     return msg
@@ -289,7 +322,7 @@ async def show_new(bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMark
 async def render(target: Target, text: str, markup: InlineKeyboardMarkup | None = None) -> Message | None:
     """Кнопка — правим её сообщение; сообщение пользователя — отвечаем новым.
     None — текст не изменился."""
-    text = fit(text[:TEXT_MAX], markup)
+    text = fit(clip(text), markup)
     bot = target.bot
     if bot is None:
         return None
@@ -350,10 +383,12 @@ class Actions:
     """Колбэки раздела вида «префикс:действие:аргумент» → функции
     (cb, state, аргумент). Пустое действие — экран самого раздела.
     Любое нажатие отменяет незаконченный ввод текста; данные мастеров
-    (ключи FSM) при этом остаются."""
+    (ключи FSM) при этом остаются. owner — раздел только для владельцев:
+    проверка на входе раздела, а не в каждой кнопке (с текстом отказа)."""
 
-    def __init__(self, router: Router, prefix: str) -> None:
+    def __init__(self, router: Router, prefix: str, owner: str = "") -> None:
         self.prefix = prefix
+        self.owner = owner
         self.table: dict[str, Handler] = {}
         router.callback_query.register(
             self._dispatch, F.data.func(lambda d: d == prefix or d.startswith(prefix + ":")))
@@ -377,6 +412,9 @@ class Actions:
         fn = self.table.get(act)
         if fn is None:
             await cb.answer("Кнопка устарела — открой меню заново", show_alert=True)
+            return
+        if self.owner and not access.is_owner(cb.from_user.id):
+            await cb.answer(self.owner, show_alert=True)
             return
         if await state.get_state() is not None:
             await state.set_state(None)

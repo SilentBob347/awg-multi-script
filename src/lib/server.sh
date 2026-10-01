@@ -304,6 +304,7 @@ _choose_dns() {
     3) S_DNS="9.9.9.9, 149.112.112.112" ;; 4) S_DNS="77.88.8.8, 77.88.8.1" ;;
     5) while true; do
          read_line d "${C}  DNS через запятую: ${N}"
+         [[ -n "$d" ]] || { S_DNS="1.1.1.1, 1.0.0.1"; break; }
          [[ "$d" =~ ^[0-9.,[:space:]]+$ ]] && { S_DNS="$d"; break; }
          warn "Нужны IPv4-адреса через запятую"
        done ;;
@@ -323,6 +324,7 @@ _choose_mtu() {  # $1 — значение по умолчанию
     1) MTU=$1 ;; 2) MTU=1420 ;; 3) MTU=1380 ;; 4) MTU=1320 ;; 5) MTU=1280 ;;
     6) while true; do
          read_line v "${C}  MTU (1280-1500): ${N}"
+         [[ -n "$v" ]] || { MTU=$1; break; }
          [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) && { MTU=$v; break; }
          warn "Число 1280-1500"
        done ;;
@@ -353,6 +355,19 @@ _choose_proto() {
   else
     S_PROTO=2.0
   fi
+}
+
+# Регион — явным выбором, как в боте и панели: «Сервер в России? [y/N]»
+# с Enter уходил дальше молча, и было непонятно, что выбрано.
+_choose_region() {
+  local c
+  echo -e "  ${W}Где сервер${N}"
+  echo -e "  ${G}1${N} Европа / мир"
+  echo -e "  ${G}2${N} Россия"
+  echo -e "  ${D}    мимикрия берёт домены, привычные для страны сервера${N}"
+  read_choice c "${C}  Выбор [1-2] (Enter = 1): ${N}" 1 2 1
+  if [[ "$c" == 2 ]]; then S_REGION=ru; else S_REGION=world; fi
+  ok "Регион: $([[ "$S_REGION" == ru ]] && echo "Россия" || echo "Европа / мир")"
 }
 
 _choose_profile() {
@@ -389,7 +404,13 @@ _choose_net() {
     return 0
   fi
   while true; do
-    read_line v "${C}  Подсеть вида 10.8.0.0/24: ${N}"
+    read_line v "${C}  Подсеть вида 10.8.0.0/24 (Enter — случайная): ${N}"
+    # Пусто (Enter или Ctrl+D) — как пункт 1, а не обрыв мастера и не повтор
+    if [[ -z "$v" ]]; then
+      S_NET=$(pick_awg_net) || { err "Не нашёл свободную /24"; return 1; }
+      info "Подсеть: $S_NET"
+      return 0
+    fi
     if valid_cidr "$v" && [[ "${v#*/}" == 24 ]]; then
       v="${v%.*}.0/24"
       if taken_networks | py net-overlaps "$v" >/dev/null; then
@@ -516,7 +537,9 @@ do_create_server() {
 
   echo ""
   hdr "Создание сервера"
-  if ask_yes "  Сервер в России (пулы доменов мимикрии под РФ)? [y/N]: " n; then S_REGION=ru; else S_REGION=world; fi
+  _choose_region
+  echo ""
+  hdr "DNS клиентов"
   _choose_dns
   _choose_profile || return 0
   if [[ "$S_PROFILE" == lite ]]; then _choose_mtu 1280; else _choose_mtu 1320; fi
@@ -644,7 +667,9 @@ mimicry_module_warnings() {
   if [[ "$(server_proto)" == 3.1 ]] && grep -qsE '^I1 = ' "$CLIENT_DIR"/*_awg3.conf; then
     mod_trailer_fix || { [[ $? -eq 1 ]] && warn "Модуль дописывает хвост к I1-I5 — мимикрия слабее. Обнови модуль (Сервер → Модуль ядра)"; }
   fi
-  n=$(awk -F' = ' '/^I[1-5] = /{n += length($2)} END{print n+0}' "$CLIENT_DIR"/*_awg[23].conf 2>/dev/null | sort -n | tail -1)
+  # Длина цепочки — по каждому файлу отдельно, берём наибольшую.
+  n=$(awk -F' = ' 'FNR == 1 {if (NR > 1) print n; n = 0} /^I[1-5] = /{n += length($2)} END{print n+0}' \
+        "$CLIENT_DIR"/*_awg[23].conf 2>/dev/null | sort -n | tail -1)
   (( ${n:-0} > 3598 )) && warn "Цепочка I1-I5 длиннее $n симв — выше предела awg-tools (буфер 4 КБ)"
   return 0
 }

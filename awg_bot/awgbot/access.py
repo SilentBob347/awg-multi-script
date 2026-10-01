@@ -4,7 +4,8 @@
 admins.json. Бот — это root на сервере, поэтому проверка стоит одним слоем
 на входе диспетчера, а не в каждом обработчике: кнопка, где забыли бы
 проверку, была бы дырой. Мимо проверки проходит только /start — через него
-приходят приглашения и подсказка «твой ID».
+приходят приглашения и подсказка «твой ID». Группы и каналы бот не слушает
+вовсе, даже владельца: отвечает только в личных сообщениях.
 """
 
 from __future__ import annotations
@@ -46,13 +47,28 @@ def all_ids() -> set[int]:
 
 
 class AccessMiddleware(BaseMiddleware):
+    @staticmethod
+    def _is_start(text: str | None) -> bool:
+        """Ровно команда /start (с «@бот» или payload приглашения), а не
+        «/startfoo»: та прошла бы мимо CommandStart() в общий обработчик и
+        показала бы чужому меню со сводкой сервера."""
+        parts = (text or "").split(maxsplit=1)
+        return bool(parts) and parts[0].partition("@")[0] == "/start"
+
     async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
                        event: TelegramObject, data: dict[str, Any]) -> Any:
         user = data.get("event_from_user")
         uid = user.id if user else 0
+        # Только личка: в группе конфиги, ключи и QR увидели бы все участники
+        chat = data.get("event_chat")
+        if getattr(chat, "type", None) != "private":
+            if isinstance(event, CallbackQuery):
+                await event.answer("Бот работает только в личных сообщениях", show_alert=True)
+            log.info("Не личный чат — пропущено: %s (%s)", getattr(chat, "id", "—"), getattr(chat, "type", "—"))
+            return None
         if authorized(uid):
             return await handler(event, data)
-        if isinstance(event, Message) and (event.text or "").startswith("/start"):
+        if isinstance(event, Message) and self._is_start(event.text):
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
             await event.answer("⛔️ Нет доступа", show_alert=True)

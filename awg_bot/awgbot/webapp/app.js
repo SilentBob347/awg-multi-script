@@ -198,7 +198,7 @@ function menuToChat() {
 const topEl = document.getElementById("top");
 function drawTop(compact = false) {
   const dark = document.documentElement.dataset.theme === "dark";
-  const beta = S.channel === "beta";
+  const beta = S.channel === "beta", upd = !!S.update && S.update !== S.version;
   // Открыли в браузере, без Telegram: разделы и настройки вида всё равно не
   // откроются — в шапке щит, название и «Поддержать»
   const inTg = !!(tg && tg.initData), home = inTg ? () => go("/") : null;
@@ -206,8 +206,11 @@ function drawTop(compact = false) {
   topEl.replaceChildren(...[
     h("div", { class: "logo", onclick: home }, icon("shield-check")),
     // Бета — плашкой справа; не влезает (узкий экран, крупный масштаб) — «β» у версии
-    h("div", { class: "ver", onclick: home }, h("b", {}, "AwgToolza"),
-      S.version ? h("span", {}, S.version, beta && compact ? h("span", { class: "warn" }, " β") : null) : null),
+    // В канале новее — у версии стрелка ↑, и плашка ведёт на «Обновление»
+    h("div", { class: "ver", onclick: upd && inTg ? () => go("/update") : home, title: upd ? `Доступна ${S.update}` : null },
+      h("b", {}, "AwgToolza"),
+      S.version ? h("span", {}, S.version, upd ? h("i", { class: "upd" }, icon("arrow-up")) : null,
+        beta && compact ? h("span", { class: "warn" }, " β") : null) : null),
     beta && !compact ? pill("бета", "warn chan") : null,
     h("div", { class: "sp" }),
     ...(inTg ? topButtons(dark) : [supportButton()]),
@@ -246,13 +249,20 @@ function toast(text, ms = 2000) {
   document.body.append(t);
   setTimeout(() => { t.remove(); if (toastEl === t) toastEl = null; }, ms);
 }
+// showAlert/showConfirm — это showPopup: текст длиннее 256 символов не
+// обрезается, а бросает WebAppPopupParamInvalid, и окно не появляется вовсе.
+const POPUP_MAX = 256;
+const popupText = (text) => (text.length > POPUP_MAX ? text.slice(0, POPUP_MAX - 1) + "…" : text);
 function fail(e) {
   haptic("error");
   const tail = (e.log || "").trim().split("\n").slice(-6).join("\n");
   const text = "❌ " + e.message + (tail && tail !== e.message ? "\n\n" + tail : "");
-  if (tg && tg.showAlert) tg.showAlert(text.slice(0, 1000)); else alert(text);
+  if (!tg || !tg.showAlert) return alert(text);
+  // Длинная ошибка с хвостом журнала — листом снизу, целиком
+  if (text.length <= POPUP_MAX) tg.showAlert(text); else logSheet("❌ " + (e.message || "Ошибка").slice(0, 80), text);
 }
 function confirmTg(text) {
+  text = popupText(text);
   return new Promise((ok) => (tg && tg.showConfirm ? tg.showConfirm(text, ok) : ok(window.confirm(text))));
 }
 // Выбор снизу: [{label, value, cls}] → значение или null
@@ -539,6 +549,7 @@ route(/^\/$/, async (ctx) => {
   S.me = me;
   S.version = d.version;
   S.channel = d.channel;
+  S.update = d.update || "";
   drawTop();
   if (cl) {
     S.clients = cl;
@@ -604,7 +615,7 @@ function clientTags(c) {
   ];
 }
 async function removeClients(btn, names, after) {
-  const list = names.slice(0, 20).join(", ") + (names.length > 20 ? "…" : "");
+  const list = names.slice(0, 5).join(", ") + (names.length > 5 ? ` и ещё ${names.length - 5}` : "");
   if (!await confirmTg(names.length === 1 ? `Удалить клиента ${names[0]}? Его конфиг перестанет работать.`
     : `Удалить клиентов: ${names.length}?\n${list}\n\nИх конфиги перестанут работать.`)) return;
   await busy(btn, async () => {
@@ -1787,12 +1798,20 @@ function changelogView(c) {
       h("div", { class: "chlog-v" }, x.version, x.title ? h("span", {}, " · " + x.title) : null), mdBlocks(x.body)]))];
 }
 // Установлена новая версия awg2 — шапка показывает её сразу, не дожидаясь главной
-const setVersion = (v) => { if (v && v !== S.version) { S.version = v; drawTop(); } };
+const setVersion = (v) => {
+  if (!v || v === S.version) return;
+  S.version = v;
+  if (S.update === v) S.update = "";
+  drawTop();
+};
+// Версия в канале новее установленной ("" — нет): стрелка ↑ в шапке
+const setUpdate = (v) => { v = v || ""; if (v !== (S.update || "")) { S.update = v; drawTop(); } };
 
 route(/^\/update$/, async (ctx) => {
   const [d, me] = await Promise.all([call("update", "status"), post("/api/me")]);
   const beta = d.channel === "beta", latest = d.available || "";
   setVersion(d.version);
+  setUpdate(latest);
   const notes = h("div", { class: "card" }, h("div", { class: "muted small" }, "Загружаю список изменений…"));
   call("update", "changelog").then((c) => {
     if (!ctx.live()) return;
@@ -1804,6 +1823,7 @@ route(/^\/update$/, async (ctx) => {
   async function check(b) {
     await busy(b, async () => {
       const r = await call("update", "check");
+      setUpdate(r.newer ? r.latest : "");
       haptic();
       toast(r.newer ? `⬆️ Доступна ${r.latest}` : `Обновлений нет — в канале ${r.latest}`, 3000);
       render();
@@ -2158,8 +2178,11 @@ route(/^\/bot\/app$/, async (ctx) => {
   const w = d.webapp || {};
   const dom = h("input", { placeholder: "panel.example.com", autocapitalize: "off", autocomplete: "off" });
   const port = h("input", { type: "number", min: 1, max: 65535, placeholder: String(w.port || 8443) });
+  // После выпуска — перезапуск сервера Mini App: иначе при смене домен ↔ IP
+  // адрес панели и кнопка «Меню» остаются старыми при новом сертификате.
   const issueJob = (head, args, after) => runJob(ctx, head, args, () => [
-    hint(after), btn("Закрыть панель", () => (tg && tg.close ? tg.close() : null), "btn-primary btn-block")]);
+    hint(after), btn("Закрыть панель", () => (tg && tg.close ? tg.close() : null), "btn-primary btn-block")])
+    .then(() => post("/api/bot/webapp/restart").catch(() => {}));
   // Готовый сертификат сервера: выбрать из найденных и сослаться на него
   const useFound = async () => {
     const rows = (await call("cert", "find")) || [];
@@ -2213,7 +2236,7 @@ route(/^\/bot\/app$/, async (ctx) => {
       const v = dom.value.trim().toLowerCase();
       if (!DOMAIN_RE.test(v)) return fail(new Error("Нужен домен вида panel.example.com"));
       return issue(`Сертификат на ${v}`, ["cert", "issue", "domain", v], `Сертификат на ${v} выпущен. Панель переезжает на домен — `
-        + "закрой её и открой снова кнопкой «Меню».").then(() => post("/api/bot/webapp/restart").catch(() => {}));
+        + "закрой её и открой снова кнопкой «Меню».");
     }, "btn-block"),
     hint("На IP — сертификат живёт ~6 дней и продлевается сам; для проверки нужен свободный и открытый порт 80. На домен — 90 дней. "
       + "Готовый — уже выпущенный Caddy, certbot, Marzban, 3x-ui или nginx: порт 80 не нужен."),
@@ -2271,6 +2294,6 @@ if (!tg || !tg.initData) {
   render();
   // Версия в шапке — для экранов, открытых не с главной
   call("version").then((v) => {
-    if (!S.version && v) { S.version = v.version; S.channel = v.channel || S.channel; drawTop(); }
+    if (!S.version && v) { S.version = v.version; S.channel = v.channel || S.channel; S.update = v.update || ""; drawTop(); }
   }).catch(() => {});
 }
